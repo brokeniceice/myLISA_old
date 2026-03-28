@@ -1,0 +1,8 @@
+checkpoints/
+datasets/
+swanlog/
+vis_output/
+eval_aigc_cls.py
+eval_aigc_seg.py
+sample_mini_test.py
+__pycache__/

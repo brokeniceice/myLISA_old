@@ -1,0 +1,353 @@
+import os
+import random
+import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
+import numpy as np
+from torch.utils.data import DataLoader, random_split, Dataset
+from torchvision import datasets
+from sklearn.metrics import accuracy_score, f1_score
+from model.llava.model.resnet_expert import ResNetExpert  
+import swanlab  
+from tqdm import tqdm  
+from PIL import Image
+import io
+import cv2
+import math
+
+# ----------------------------
+# ⚙️ 1. 配置参数 & 初始化
+# ----------------------------
+DATA_DIR = "datasets"
+BATCH_SIZE = 32
+NUM_EPOCHS = 15
+LR = 5e-4
+IMG_SIZE = 224
+DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
+SEED = 42
+NUM_WORKERS = 16
+
+torch.manual_seed(SEED)
+random.seed(SEED)
+np.random.seed(SEED)
+
+swanlab.init(
+    project="myLISA",
+    name="Stage1-NPR-Baseline",  # 标识为无鲁棒性增强的 Baseline
+    config={
+        "batch_size": BATCH_SIZE,
+        "epochs": NUM_EPOCHS,
+        "lr": LR,
+        "img_size": IMG_SIZE,
+        "seed": SEED,
+        "expansion": "1x",  # 回归 1x 数据集
+        "split": "8:1:1",
+
+    }
+)
+
+# ----------------------------
+# 🛡️ 2. 底层扰动函数 (仅用于测试阶段生成盲测数据)
+# ----------------------------
+def apply_jpeg_compression(image_np, quality):
+    img_pil = Image.fromarray(image_np)
+    buffer = io.BytesIO()
+    img_pil.save(buffer, format="JPEG", quality=quality)
+    buffer.seek(0)
+    return np.array(Image.open(buffer))
+
+def apply_resizing(image_np, scale):
+    h, w = image_np.shape[:2]
+    new_w, new_h = int(w * scale), int(h * scale)
+    img_down = cv2.resize(image_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    img_restored = cv2.resize(img_down, (w, h), interpolation=cv2.INTER_CUBIC)
+    return img_restored
+
+def apply_gaussian_noise(image_np, variance):
+    sigma = math.sqrt(variance)
+    noise = np.random.normal(0, sigma, image_np.shape)
+    noisy_image = image_np.astype(np.float32) + noise
+    return np.clip(noisy_image, 0, 255).astype(np.uint8)
+
+# ----------------------------
+# 🖼️ 3. 基础空间与色彩变换 (PIL/Tensor级别)
+# ----------------------------
+base_train_transform = transforms.Compose([
+    transforms.Resize(IMG_SIZE),
+    transforms.RandomCrop((IMG_SIZE, IMG_SIZE)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.ColorJitter(brightness=0.1, contrast=0.1),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.48145466, 0.4578275, 0.40821073],
+        std=[0.26862954, 0.26130258, 0.27577711]
+    )
+])
+
+base_val_transform = transforms.Compose([
+    transforms.Resize(IMG_SIZE),
+    transforms.CenterCrop((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.48145466, 0.4578275, 0.40821073],
+        std=[0.26862954, 0.26130258, 0.27577711]
+    )
+])
+
+# ----------------------------
+# 🔄 4. 转换管道包装器 (Numpy -> PIL -> Tensor)
+# ----------------------------
+class StandardTrainTransform:
+    """标准训练管道：仅作基础增强，无恶劣扰动"""
+    def __init__(self, base_transform):
+        self.base_transform = base_transform
+    def __call__(self, img_np):
+        img_pil = Image.fromarray(img_np)
+        return self.base_transform(img_pil)
+
+class RobustnessTransform:
+    """鲁棒性测试管道：注入恶劣扰动"""
+    def __init__(self, base_transform, attack_type=None, attack_params=None):
+        self.base_transform = base_transform
+        self.attack_type = attack_type
+        self.attack_params = attack_params if attack_params else {}
+    
+    def __call__(self, img_np):
+        if self.attack_type == "jpeg":
+            quality = self.attack_params.get('quality', 70)
+            img_np = apply_jpeg_compression(img_np, quality)
+        elif self.attack_type == "resize":
+            scale = self.attack_params.get('scale', 0.5)
+            img_np = apply_resizing(img_np, scale)
+        elif self.attack_type == "noise":
+            variance = self.attack_params.get('variance', 5)
+            img_np = apply_gaussian_noise(img_np, variance)
+        
+        img_pil = Image.fromarray(img_np)
+        return self.base_transform(img_pil)
+
+# 测试集盲测变换字典 (保持 7 种条件不变)
+test_transforms_dict = {
+    "Clean 原图": lambda img: RobustnessTransform(base_val_transform, None)(img),
+    "JPEG 70": lambda img: RobustnessTransform(base_val_transform, "jpeg", {'quality': 70})(img),
+    "JPEG 80": lambda img: RobustnessTransform(base_val_transform, "jpeg", {'quality': 80})(img),
+    "Resize 0.5": lambda img: RobustnessTransform(base_val_transform, "resize", {'scale': 0.5})(img),
+    "Resize 0.75": lambda img: RobustnessTransform(base_val_transform, "resize", {'scale': 0.75})(img),
+    "Noise Var=5": lambda img: RobustnessTransform(base_val_transform, "noise", {'variance': 5})(img),
+    "Noise Var=10": lambda img: RobustnessTransform(base_val_transform, "noise", {'variance': 10})(img),
+}
+
+# ----------------------------
+# 📦 5. 数据集加载与切分
+# ----------------------------
+def cv2_loader(path):
+    """自定义加载器：确保底层使用 cv2 读取并转换为 RGB Numpy 数组"""
+    image_np = cv2.imread(path)
+    if image_np is None:
+        return np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8) # 容错
+    image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+    return image_np
+
+class MapDataset(Dataset):
+    def __init__(self, subset, transform=None):
+        self.subset = subset
+        # 默认使用干净的验证集变换
+        self.transform = transform if transform else (lambda img: RobustnessTransform(base_val_transform, None)(img))
+
+    def __getitem__(self, index):
+        x, y = self.subset[index]
+        x_tensor = self.transform(x)
+        return x_tensor, y
+
+    def __len__(self):
+        return len(self.subset)
+
+# 使用 cv2_loader 初始化数据集
+full_dataset = datasets.ImageFolder(root=os.path.join(DATA_DIR, "train"), loader=cv2_loader)
+total_size = len(full_dataset)
+
+train_size = int(0.8 * total_size)
+val_size = int(0.1 * total_size)
+test_size = total_size - train_size - val_size
+
+train_subset, val_subset, test_subset = random_split(full_dataset, [train_size, val_size, test_size])
+
+# 【核心修改点】训练集直接使用 StandardTrainTransform，不再扩容
+train_dataset = MapDataset(train_subset, transform=StandardTrainTransform(base_train_transform))
+val_dataset = MapDataset(val_subset) 
+
+train_loader = DataLoader(
+    train_dataset, batch_size=BATCH_SIZE, shuffle=True, 
+    num_workers=NUM_WORKERS, pin_memory=True, prefetch_factor=4, persistent_workers=True
+)
+val_loader = DataLoader(
+    val_dataset, batch_size=BATCH_SIZE, shuffle=False, 
+    num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True
+)
+
+# ----------------------------
+# 🧠 6. 模型与优化器初始化
+# ----------------------------
+model = ResNetExpert(use_low_level="npr", pretrained=True).to(DEVICE) 
+
+class TemporaryClassifier(nn.Module):
+    def __init__(self, input_dim=512, num_classes=2):
+        super().__init__()
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1)) 
+        self.head = nn.Linear(input_dim, num_classes)
+    def forward(self, x):
+        x = self.avgpool(x)       
+        x = x.view(x.size(0), -1) 
+        return self.head(x)       
+
+classifier = TemporaryClassifier(input_dim=512, num_classes=2).to(DEVICE)
+
+optimizer = torch.optim.AdamW(list(model.parameters()) + list(classifier.parameters()), lr=LR, weight_decay=1e-4)
+criterion = nn.CrossEntropyLoss()
+
+total_steps = len(train_loader) * NUM_EPOCHS
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
+
+# ----------------------------
+# 🏃 7. 训练与验证逻辑
+# ----------------------------
+global_step = 0 
+
+def train_one_epoch(model, classifier, loader, optimizer, criterion, scheduler, epoch):
+    global global_step
+    model.train()
+    classifier.train()
+    running_loss, correct, total = 0.0, 0, 0
+    
+    pbar = tqdm(loader, desc=f"Train Epoch {epoch}/{NUM_EPOCHS}", leave=False)
+    for step, (imgs, labels) in enumerate(pbar):
+        imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+        
+        optimizer.zero_grad()
+        features = model(imgs)               
+        logits = classifier(features)        
+        loss = criterion(logits, labels)
+        
+        loss.backward()
+        optimizer.step()
+        scheduler.step()  
+        global_step += 1
+        
+        batch_loss = loss.item()
+        preds = logits.argmax(dim=1)
+        batch_acc = (preds == labels).sum().item() / imgs.size(0)
+        
+        swanlab.log({
+            "Train/Loss": batch_loss,
+            "Train/Accuracy": batch_acc,
+            "Train/Learning_Rate": scheduler.get_last_lr()[0]
+        }, step=global_step)
+        
+        running_loss += batch_loss * imgs.size(0)
+        correct += (preds == labels).sum().item()
+        total += imgs.size(0)
+        
+    return running_loss / total, correct / total
+
+@torch.no_grad()
+def validate(model, classifier, loader, criterion, epoch):
+    model.eval()
+    classifier.eval()
+    running_loss, correct, total = 0.0, 0, 0
+    
+    pbar = tqdm(loader, desc=f"  Val Epoch {epoch}/{NUM_EPOCHS}", leave=False)
+    for imgs, labels in pbar:
+        imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+        features = model(imgs)
+        logits = classifier(features)
+        loss = criterion(logits, labels)
+        
+        running_loss += loss.item() * imgs.size(0)
+        preds = logits.argmax(dim=1)
+        correct += (preds == labels).sum().item()
+        total += imgs.size(0)
+        
+    return running_loss / total, correct / total
+
+# ----------------------------
+# 🎬 8. 主流程执行
+# ----------------------------
+print("=" * 60)
+print(f"📊 数据集切分 (8:1:1) 完毕 | CV2底座对齐 | 纯净版无扩容:")
+print(f"   - 基础训练集 (Train)   : {len(train_dataset)} 张")
+print(f"   - 验证集 (Val)         : {len(val_dataset)} 张")
+print(f"   - 测试盲测集 (Test)    : {len(test_subset)} 张")
+print(f"🚀 开始 Stage-1 NPR 预训练 (Baseline)，共计 {total_steps} 步...")
+print("=" * 60)
+
+best_val_acc = 0.0
+CHECKPOINT_DIR = "./checkpoints"
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+SAVE_PATH = os.path.join(CHECKPOINT_DIR, "npr_stage1.pth") 
+
+for epoch in range(1, NUM_EPOCHS + 1):
+    train_loss, train_acc = train_one_epoch(model, classifier, train_loader, optimizer, criterion, scheduler, epoch)
+    val_loss, val_acc = validate(model, classifier, val_loader, criterion, epoch)
+
+    swanlab.log({
+        "Val/Loss": val_loss,
+        "Val/Accuracy": val_acc,
+        "Epoch": epoch
+    }, step=global_step)
+    
+    print(f"[Epoch {epoch:02d}/{NUM_EPOCHS}] Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f} Acc: {val_acc:.4f}")
+
+    if val_acc > best_val_acc:
+        print(f"⭐ 发现巅峰模型！验证集准确率提升至 {val_acc:.4f}！已保存。")
+        best_val_acc = val_acc
+        torch.save({
+            'resnet': model.state_dict(),
+            'classifier': classifier.state_dict(),
+        }, SAVE_PATH)
+
+print("=" * 60)
+print(f"🎉 训练阶段结束！最佳验证准确率: {best_val_acc:.4f}")
+
+# ----------------------------
+# 🛡️ 9. 终极鲁棒性盲测阶段 (保持 7 个条件全部测试)
+# ----------------------------
+print("\n" + "=" * 60)
+print("🛡️ 开始在测试集上进行全方位鲁棒性评估 (Robustness Test)...")
+print("=" * 60)
+
+checkpoint = torch.load(SAVE_PATH, map_location=DEVICE)
+model.load_state_dict(checkpoint['resnet'])
+classifier.load_state_dict(checkpoint['classifier'])
+
+model.eval()
+classifier.eval()
+
+for name, transform_func in test_transforms_dict.items():
+    current_test_dataset = MapDataset(test_subset, transform=transform_func)
+    current_test_loader = DataLoader(current_test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+    
+    all_preds = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for imgs, labels in tqdm(current_test_loader, desc=f"Testing [{name}]", leave=False):
+            imgs = imgs.to(DEVICE)
+            features = model(imgs)
+            logits = classifier(features)
+            
+            preds = logits.argmax(dim=1).cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(labels.numpy())
+            
+    acc = accuracy_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds, average='macro')
+    
+    print(f" 📊 [{name:<15}] -> ACC: {acc:.4f} | Macro F1: {f1:.4f}")
+    
+    swanlab.log({
+        f"Test_ACC/{name}": acc,
+        f"Test_F1/{name}": f1
+    })
+
+print("=" * 60)
+print("🏆 Baseline 测试流程圆满收官！")

@@ -1,0 +1,510 @@
+from typing import List
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import BitsAndBytesConfig, CLIPVisionModel
+
+from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
+                         DEFAULT_IMAGE_PATCH_TOKEN)
+
+from .llava.model.language_model.llava_llama import (LlavaLlamaForCausalLM,
+                                                     LlavaLlamaModel)
+from .segment_anything import build_sam_vit_h
+
+
+def dice_loss(
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    num_masks: float,
+    scale=1000,  # 100000.0,
+    eps=1e-6,
+):
+    """
+    Compute the DICE loss, similar to generalized IOU for masks
+    Args:
+        inputs: A float tensor of arbitrary shape.
+                The predictions for each example.
+        targets: A float tensor with the same shape as inputs. Stores the binary
+                 classification label for each element in inputs
+                (0 for the negative class and 1 for the positive class).
+    """
+    inputs = inputs.sigmoid()
+    inputs = inputs.flatten(1, 2)
+    targets = targets.flatten(1, 2)
+    numerator = 2 * (inputs / scale * targets).sum(-1)
+    denominator = (inputs / scale).sum(-1) + (targets / scale).sum(-1)
+    loss = 1 - (numerator + eps) / (denominator + eps)
+    loss = loss.sum() / (num_masks + 1e-8)
+    return loss
+
+
+def sigmoid_ce_loss(
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    num_masks: float,
+):
+    """
+    Args:
+        inputs: A float tensor of arbitrary shape.
+                The predictions for each example.
+        targets: A float tensor with the same shape as inputs. Stores the binary
+                 classification label for each element in inputs
+                (0 for the negative class and 1 for the positive class).
+    Returns:
+        Loss tensor
+    """
+    loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    loss = loss.flatten(1, 2).mean(1).sum() / (num_masks + 1e-8)
+    return loss
+
+
+class LisaMetaModel:
+    def __init__(
+        self,
+        config,
+        **kwargs,
+    ):
+        super(LisaMetaModel, self).__init__(config)
+
+        self.config = config
+        if not hasattr(self.config, "train_mask_decoder"):
+            self.config.train_mask_decoder = kwargs["train_mask_decoder"]
+            self.config.out_dim = kwargs["out_dim"]
+            self.vision_pretrained = kwargs.get("vision_pretrained", None)
+        else:
+            self.vision_pretrained = kwargs.get("vision_pretrained", None)
+            self.initialize_lisa_modules(self.config)
+
+    def initialize_lisa_modules(self, config):
+        # SAM
+        self.visual_model = build_sam_vit_h(self.vision_pretrained)
+        for param in self.visual_model.parameters():
+            param.requires_grad = False
+        if config.train_mask_decoder:
+            self.visual_model.mask_decoder.train()
+            for param in self.visual_model.mask_decoder.parameters():
+                param.requires_grad = True
+
+        # Projection layer
+        in_dim = config.hidden_size
+        out_dim = config.out_dim
+        text_fc = [
+            nn.Linear(in_dim, in_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_dim, out_dim),
+            nn.Dropout(0.0),
+        ]
+        self.text_hidden_fcs = nn.ModuleList([nn.Sequential(*text_fc)])
+        self.text_hidden_fcs.train()
+        for param in self.text_hidden_fcs.parameters():
+            param.requires_grad = True
+
+
+class LisaModel(LisaMetaModel, LlavaLlamaModel):
+    def __init__(
+        self,
+        config,
+        **kwargs,
+    ):
+        super(LisaModel, self).__init__(config, **kwargs)
+
+        self.config.use_cache = False
+        self.config.vision_tower = self.config.mm_vision_tower
+        self.config.mm_vision_select_feature = "patch"
+        self.config.image_aspect_ratio = "square"
+        self.config.image_grid_pinpoints = None
+        self.config.tune_mm_mlp_adapter = False
+        self.config.freeze_mm_mlp_adapter = True
+        self.config.pretrain_mm_mlp_adapter = None
+        self.config.mm_use_im_patch_token = False
+
+
+class LISAForCausalLM(LlavaLlamaForCausalLM):
+    def __init__(
+        self,
+        config,
+        **kwargs,
+    ):
+        if not hasattr(config, "train_mask_decoder"):
+            config.mm_use_im_start_end = kwargs.pop("use_mm_start_end", True)
+            config.mm_vision_tower = kwargs.get(
+                "vision_tower", "openai/clip-vit-large-patch14"
+            )
+            self.ce_loss_weight = kwargs.pop("ce_loss_weight", None)
+            self.dice_loss_weight = kwargs.pop("dice_loss_weight", None)
+            self.bce_loss_weight = kwargs.pop("bce_loss_weight", None)
+        else:
+            config.mm_vision_tower = config.vision_tower
+            self.ce_loss_weight = kwargs.pop("ce_loss_weight", None)
+            self.dice_loss_weight = kwargs.pop("dice_loss_weight", None)
+            self.bce_loss_weight = kwargs.pop("bce_loss_weight", None)
+            
+        self.seg_token_idx = kwargs.pop("seg_token_idx")
+
+        super().__init__(config)
+
+        self.model = LisaModel(config, **kwargs)
+
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_visual_embs(self, pixel_values: torch.FloatTensor):
+        with torch.no_grad():
+            image_embeddings_list = []
+            for i in range(pixel_values.shape[0]):
+                torch.cuda.empty_cache()
+                image_embeddings = self.model.visual_model.image_encoder(
+                    pixel_values[i].unsqueeze(0)
+                )
+                image_embeddings_list.append(image_embeddings)
+            torch.cuda.empty_cache()
+            image_embeddings = torch.cat(image_embeddings_list, 0)
+        return image_embeddings
+
+    def forward(self, **kwargs):
+        if "past_key_values" in kwargs:
+            return super().forward(**kwargs)
+        return self.model_forward(**kwargs)
+
+    def model_forward(
+        self,
+        images: torch.FloatTensor,
+        images_clip: torch.FloatTensor,
+        input_ids: torch.LongTensor,
+        labels: torch.LongTensor,
+        attention_masks: torch.LongTensor,
+        offset: torch.LongTensor,
+        masks_list: List[torch.FloatTensor],
+        label_list: List[torch.Tensor],
+        resize_list: List[tuple],
+        inference: bool = False,
+        **kwargs,
+    ):
+        # =================================================================================
+        # 🔥🔥🔥 优化开关：检测是否需要运行 SAM 分支 🔥🔥🔥
+        # 如果 masks_list 为 None，说明是纯文本/多模态指令微调，不需要分割
+        # =================================================================================
+        run_sam_branch = (masks_list is not None)
+        if run_sam_branch and images is None:
+            raise ValueError("masks_list is provided but images (SAM input) is None!")
+        
+        # 1. SAM Image Encoder (最吃显存的部分)
+        # 只有在需要分割时才计算，否则直接跳过，节省大量显存
+        image_embeddings = None
+        if run_sam_branch:
+            image_embeddings = self.get_visual_embs(images)
+            batch_size = image_embeddings.shape[0]
+            assert batch_size == len(offset) - 1
+        
+        # 2. 准备 SEG token mask (辅助逻辑)
+        # 虽然这部分计算量不大，但如果不需要 SAM，也没必要跑
+        seg_token_mask = None
+        if run_sam_branch:
+            # 利用 labels != -100，屏蔽掉所有属于 prompt(query) 里的 [SEG]
+            valid_mask = labels[:, 1:] != -100
+            seg_token_mask = (input_ids[:, 1:] == self.seg_token_idx) & valid_mask
+            seg_token_mask = torch.cat(
+                [
+                    seg_token_mask,
+                    torch.zeros((seg_token_mask.shape[0], 1)).bool().cuda(),
+                ],
+                dim=1,
+            )
+            # hack for IMAGE_TOKEN_INDEX
+            seg_token_mask = torch.cat(
+                [torch.zeros((seg_token_mask.shape[0], 255)).bool().cuda(), seg_token_mask], #消融feature情况下是255,Ours是511
+                dim=1,
+            )
+        # =================================================================================
+        # 3. LLM Forward (核心部分：NPR Projector 和 LLM 都在这里训练)
+        # =================================================================================
+        if inference:
+            n_batch = 1
+            length = input_ids.shape[0]
+            assert images_clip.shape[0] == 1
+            images_clip_extend = images_clip.expand(length, -1, -1, -1).contiguous()
+
+            output_hidden_states = []
+            for i in range(n_batch):
+                start_i, end_i = i * length, min((i + 1) * length, input_ids.shape[0])
+                output_i = super().forward(
+                    images=images_clip_extend[: end_i - start_i],
+                    attention_mask=attention_masks[start_i:end_i],
+                    input_ids=input_ids[start_i:end_i],
+                    output_hidden_states=True,
+                )
+                output_hidden_states.append(output_i.hidden_states)
+                torch.cuda.empty_cache()
+
+            output_hidden_states_list = []
+            output_hidden_states_level = torch.cat(output_hidden_states, dim=0)
+            output_hidden_states_list.append(output_hidden_states_level)
+            output_hidden_states = output_hidden_states_list
+            output = None
+
+        else:
+            images_clip_list = []
+            for i in range(len(offset) - 1):
+                start_i, end_i = offset[i], offset[i + 1]
+                images_clip_i = (
+                    images_clip[i]
+                    .unsqueeze(0)
+                    .expand(end_i - start_i, -1, -1, -1)
+                    .contiguous()
+                )
+                images_clip_list.append(images_clip_i)
+            images_clip = torch.cat(images_clip_list, dim=0)
+
+            output = super().forward(
+                images=images_clip,
+                attention_mask=attention_masks,
+                input_ids=input_ids,
+                labels=labels,
+                output_hidden_states=True,
+            )
+            output_hidden_states = output.hidden_states
+        # =================================================================================
+        # 4. 早期退出 (Early Exit)
+        # 如果没有 mask，直接返回文本 Loss，不再往下跑 SAM 解码器
+        # =================================================================================
+        if not run_sam_branch:
+            # 确保返回的字典包含所有必要的 key，防止训练循环报错，但值为 0
+            return {
+                "loss": output.loss, # 这里的 loss 只是 CE Loss (Text)
+                "ce_loss": output.loss,
+                "mask_bce_loss": torch.tensor(0.0).to(output.loss.device),
+                "mask_dice_loss": torch.tensor(0.0).to(output.loss.device),
+                "mask_loss": torch.tensor(0.0).to(output.loss.device),
+            }
+        # =================================================================================
+        # 5. 原有的 SAM 分割逻辑 (只有 run_sam_branch=True 才会执行)
+        # =================================================================================
+        hidden_states = []
+
+        assert len(self.model.text_hidden_fcs) == 1
+        hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states[-1]))
+
+        last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
+        if last_hidden_state.dim() == 2 and seg_token_mask.dim() == 2:
+            last_hidden_state = last_hidden_state.unsqueeze(0)
+        pred_embeddings = last_hidden_state[seg_token_mask]
+        seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
+
+        seg_token_offset = seg_token_counts.cumsum(-1)
+        seg_token_offset = torch.cat(
+            [torch.zeros(1).long().cuda(), seg_token_offset], dim=0
+        )
+
+        seg_token_offset = seg_token_offset[offset]
+
+        pred_embeddings_ = []
+        for i in range(len(seg_token_offset) - 1):
+            start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
+            pred_embeddings_.append(pred_embeddings[start_i:end_i])
+        pred_embeddings = pred_embeddings_
+
+        multimask_output = False
+        pred_masks = []
+        for i in range(len(pred_embeddings)):
+            if pred_embeddings[i].shape[0] == 0:
+                h, w = resize_list[i]
+                # 创建一个 [0, H, W] 的空 Tensor
+                empty_mask = torch.zeros((0, h, w), device=image_embeddings.device, dtype=image_embeddings.dtype)
+                pred_masks.append(empty_mask)
+                continue
+
+            # 2. 如果是假图 (Fake)，正常跑 SAM 流程
+            (
+                sparse_embeddings,
+                dense_embeddings,
+            ) = self.model.visual_model.prompt_encoder(
+                points=None,
+                boxes=None,
+                masks=None,
+                text_embeds=pred_embeddings[i].unsqueeze(1),
+            )
+
+            sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
+            low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
+                image_embeddings=image_embeddings[i].unsqueeze(0),
+                image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=multimask_output,
+            )
+            
+            # ✅ 修正点2：这里也直接用 resize_list[i] 作为 original_size
+            # resize_list[i] 本身就是 tuple (H, W)，完美符合 interpolate 的要求
+            pred_mask = self.model.visual_model.postprocess_masks(
+                low_res_masks,
+                input_size=resize_list[i],      # input_size 和 original_size 用同一个没问题，因为我们没有对原图做额外 crop
+                original_size=resize_list[i],   # 👈 关键修改：不再依赖 label_list
+            )
+            pred_masks.append(pred_mask[:, 0])
+               
+        model_output = output
+        gt_masks = masks_list
+
+        if inference:
+            return {
+                "pred_masks": pred_masks,
+                "gt_masks": gt_masks,
+            }
+
+        output = model_output.logits
+
+        ce_loss = model_output.loss
+        ce_loss = ce_loss * self.ce_loss_weight
+        mask_bce_loss = 0
+        mask_dice_loss = 0
+        num_masks = 0
+        for batch_idx in range(len(pred_masks)):
+            gt_mask = gt_masks[batch_idx]
+            pred_mask = pred_masks[batch_idx]
+            gt_mask = gt_mask.to(dtype=pred_mask.dtype)
+            
+            if pred_mask.shape[0] > gt_mask.shape[0]:
+                pred_mask = pred_mask[:gt_mask.shape[0]]
+            assert (
+                gt_mask.shape[0] == pred_mask.shape[0]
+            ), "gt_mask.shape: {}, pred_mask.shape: {}".format(
+                gt_mask.shape, pred_mask.shape
+            )
+            if gt_mask.shape[0] > 0:
+                mask_bce_loss += (
+                    sigmoid_ce_loss(pred_mask, gt_mask, num_masks=gt_mask.shape[0])
+                    * gt_mask.shape[0]
+                )
+                mask_dice_loss += (
+                    dice_loss(pred_mask, gt_mask, num_masks=gt_mask.shape[0])
+                    * gt_mask.shape[0]
+                )
+                num_masks += gt_mask.shape[0]
+
+        mask_bce_loss = self.bce_loss_weight * mask_bce_loss / (num_masks + 1e-8)
+        mask_dice_loss = self.dice_loss_weight * mask_dice_loss / (num_masks + 1e-8)
+        mask_loss = mask_bce_loss + mask_dice_loss
+
+        loss = ce_loss + mask_loss
+
+        return {
+            "loss": loss,
+            "ce_loss": ce_loss,
+            "mask_bce_loss": mask_bce_loss,
+            "mask_dice_loss": mask_dice_loss,
+            "mask_loss": mask_loss,
+            "pred_masks": pred_masks,
+            "logits": output,
+        }
+
+    def evaluate(
+        self,
+        images_clip,
+        images,
+        input_ids,
+        resize_list,
+        original_size_list,
+        max_new_tokens=32,
+        tokenizer=None,
+    ):
+        with torch.no_grad():
+            outputs = self.generate(
+                images=images_clip,
+                input_ids=input_ids,
+                max_new_tokens=max_new_tokens,
+                eos_token_id=tokenizer.eos_token_id, 
+                pad_token_id=tokenizer.pad_token_id,
+                num_beams=1,
+                output_hidden_states=True,
+                return_dict_in_generate=True,
+            )
+            if isinstance(outputs.hidden_states, tuple):
+                all_hidden_states = []
+                for step_states in outputs.hidden_states:
+                    # 如果返回的是 tuple (包含每一层的输出)，取最后一层
+                    if isinstance(step_states, (tuple, list)):
+                        h = step_states[-1]
+                    # 如果返回的已经是 tensor (直接是最后一层的输出)，直接使用
+                    else:
+                        h = step_states
+                    
+                    # 防御性补丁：如果被意外切成了 2 维 (seq_len, hidden_dim)
+                    # 强行给它补回第 0 维的 batch_size: (1, seq_len, hidden_dim)
+                    if h.dim() == 2:
+                        h = h.unsqueeze(0)
+                        
+                    all_hidden_states.append(h)
+                # 沿着序列长度维度 (dim=1) 完美拼接
+                output_hidden_states = torch.cat(all_hidden_states, dim=1)
+            else:
+                output_hidden_states = outputs.hidden_states[-1]
+            # =========================================================
+            
+            output_ids = outputs.sequences
+
+            seg_token_mask = output_ids[:, 1:] == self.seg_token_idx
+            prompt_len = input_ids.shape[1]
+            seg_token_mask[:, :prompt_len - 1] = False
+            # hack for IMAGE_TOKEN_INDEX (we suppose that there is only one image, and it is in the front)
+            seg_token_mask = torch.cat(
+                [
+                    torch.zeros((seg_token_mask.shape[0], 255), dtype=torch.bool, device=seg_token_mask.device), #消融情况下是255,Ours是511
+                    seg_token_mask,
+                ],
+                dim=1,
+            )
+
+            hidden_states = []
+
+            assert len(self.model.text_hidden_fcs) == 1
+            hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states))
+
+            last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
+            pred_embeddings = last_hidden_state[seg_token_mask]
+
+            seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
+            seg_token_offset = seg_token_counts.cumsum(-1)
+            seg_token_offset = torch.cat(
+                [torch.zeros(1, dtype=torch.long, device=seg_token_offset.device), seg_token_offset], dim=0
+            )
+
+            pred_embeddings_ = []
+            for i in range(len(seg_token_offset) - 1):
+                start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
+                pred_embeddings_.append(pred_embeddings[start_i:end_i])
+            pred_embeddings = pred_embeddings_
+
+            image_embeddings = self.get_visual_embs(images)
+
+            multimask_output = False
+            pred_masks = []
+            for i in range(len(pred_embeddings)):
+                (
+                    sparse_embeddings,
+                    dense_embeddings,
+                ) = self.model.visual_model.prompt_encoder(
+                    points=None,
+                    boxes=None,
+                    masks=None,
+                    text_embeds=pred_embeddings[i].unsqueeze(1),
+                )
+
+                sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
+                low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
+                    image_embeddings=image_embeddings[i].unsqueeze(0),
+                    image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
+                    sparse_prompt_embeddings=sparse_embeddings,
+                    dense_prompt_embeddings=dense_embeddings,
+                    multimask_output=multimask_output,
+                )
+                pred_mask = self.model.visual_model.postprocess_masks(
+                    low_res_masks,
+                    input_size=resize_list[i],
+                    original_size=original_size_list[i],
+                )
+                pred_masks.append(pred_mask[:, 0])
+
+        return output_ids, pred_masks
