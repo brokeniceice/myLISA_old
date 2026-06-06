@@ -38,15 +38,17 @@ def calculate_iou_f1(pred_mask, gt_mask):
     return iou, f1
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="LISA Mask Evaluation")
-    parser.add_argument("--test_json", type=str, default="./datasets/AIGI-Holmes-Dataset/dataset/test_mini_400.jsonl")
-    parser.add_argument("--image_root", type=str, default="./datasets/AIGI-Holmes-Dataset")
-    parser.add_argument("--version", default="./checkpoints_stage2/full_half_hint_epoch2/merged_final")
+    parser = argparse.ArgumentParser(description="LISA Classification Evaluation")
+    parser.add_argument("--test_json", type=str, default="/home/yz/myLISA/dataset/MMTD_Set/formatted_splits/test_aigc.json")
+    parser.add_argument("--image_root", type=str, default="/home/yz/myLISA/dataset")
+    parser.add_argument("--version", default="./checkpoints_stage2/wo_hint_epoch2/merged_final")
     parser.add_argument("--precision", default="bf16", type=str, choices=["fp32", "bf16", "fp16"])
     parser.add_argument("--image_size", default=1024, type=int)
     parser.add_argument("--model_max_length", default=2048, type=int)
     parser.add_argument("--vision-tower", default="openai/clip-vit-large-patch14", type=str)
-    parser.add_argument("--local-rank", default=0, type=int)
+    parser.add_argument("--npr_ckpt", type=str, default="./checkpoints/npr_stage1_augmented_best.pth")
+    parser.add_argument("--disable_expert_hint", action="store_true", default=True, help="是否禁用专家提示词注入")
+    parser.add_argument("--local-rank", default=1, type=int)
     parser.add_argument("--use_mm_start_end", action="store_true", default=True)
     parser.add_argument("--conv_type", default="llava_v1", type=str)
     return parser.parse_args()
@@ -66,17 +68,17 @@ def main():
     args = parse_args()
     device = torch.device(f"cuda:{args.local_rank}" if torch.cuda.is_available() else "cpu")
 
-    # 1. 过滤测试集，只保留有 GT Mask 的假图
     print(f"📂 读取并过滤测试集: {args.test_json}")
-    fake_data = []
     with open(args.test_json, 'r', encoding='utf-8') as f:
-        for line in f:
-            if not line.strip(): continue
-            item = json.loads(line)
-            mask_path = item.get("mask", "")
-            if mask_path and len(mask_path.strip()) > 0:
-                fake_data.append(item)
-    print(f"✅ 找到 {len(fake_data)} 张带有真实掩码的伪造图像用于评估。")
+        test_data = json.load(f) 
+        
+    fake_data = []
+    for item in test_data:
+        mask_path = item.get("mask", "")
+        if mask_path and isinstance(mask_path, str) and len(mask_path.strip()) > 0:
+            fake_data.append(item)
+            
+    print(f"✅ 从测试集中筛选出 {len(fake_data)} 张带有真实掩码的伪造图像。")
 
 
     npr_transform = transforms.Compose([
@@ -86,7 +88,7 @@ def main():
         transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
     ])
 
-
+    if args.disable_expert_hint: print("⏭️ 已跳过提示词注入")
     # 3. 加载 LISA 大模型
     print("🚀 加载 LISA 模型本体...")
     from transformers import AutoTokenizer, CLIPImageProcessor, AutoConfig
@@ -112,18 +114,13 @@ def main():
     # 4. 评估循环
     total_iou = 0.0
     total_f1 = 0.0
-    # 🔥 新增：用于全局像素计算 (Micro-Average) 的水池变量
-    global_intersection = 0.0
-    global_union = 0.0
-    global_pred_sum = 0.0
-    global_gt_sum = 0.0
     total_samples = 0       # 记录读取成功的总测试样本数
     valid_mask_samples = 0  # 记录成功生成掩码的样本数 (用于计算均值)
     zero_mask_count = 0     # 记录模型没有预测出掩码的次数 (LLM 漏掉 <SEG>)
 
     pbar = tqdm(fake_data, desc="Evaluating Masks")
     for item in pbar:
-        img_path = os.path.join(args.image_root, item["images"][0].lstrip("./"))
+        img_path = os.path.join(args.image_root, item["image"].lstrip("./"))
         mask_path = os.path.join(args.image_root, item["mask"].lstrip("./"))
         
         if not os.path.exists(img_path) or not os.path.exists(mask_path):
@@ -151,7 +148,10 @@ def main():
 
         # 构建 Prompt
         base_prompt = "Please determine whether this image is fake or real, and provide the reasons for your judgment. If it is a fake image, please also segment the forged area."
-        oracle_hint = "[System Forensic Expert Hint: Low-level pixel analysis indicates the presence of AIGC forgery traces in this image.]"
+        if args.disable_expert_hint:
+            oracle_hint = ""
+        else:
+            oracle_hint = "[System Forensic Expert Hint: Low-level pixel analysis indicates the presence of AIGC forgery traces in this image.]"
         prompt = base_prompt + "\n" + oracle_hint
         prompt = DEFAULT_IMAGE_TOKEN + "\n" + prompt.replace(DEFAULT_IMAGE_TOKEN, "").strip()
         if args.use_mm_start_end:
@@ -179,24 +179,8 @@ def main():
                 # 万一出现极小概率的尺寸对不齐，强制对齐防止报错
                 pred_mask = cv2.resize(pred_mask.astype(np.uint8), (gt_mask.shape[1], gt_mask.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
             
-            # 🔥 1. 提取当前图像的基础像素数据
-            intersection = np.logical_and(pred_mask, gt_mask).sum()
-            union = np.logical_or(pred_mask, gt_mask).sum()
-            pred_sum = pred_mask.sum()
-            gt_sum = gt_mask.sum()
-
-            # 🔥 2. 累加到全局水池 (用于计算 SIDA 同款的 Micro-Average)
-            global_intersection += intersection
-            global_union += union
-            global_pred_sum += pred_sum
-            global_gt_sum += gt_sum
-
-            # 🔥 3. 计算单图指标并累加 (用于计算现有的 Macro-Average)
-            iou = intersection / union if union > 0 else 0.0
-            f1 = (2 * intersection) / (pred_sum + gt_sum) if (pred_sum + gt_sum) > 0 else 0.0
-
-            # # ✅ 仅在成功生成掩码时，才计算并累加 IoU 和 F1
-            # iou, f1 = calculate_iou_f1(pred_mask, gt_mask)
+            # ✅ 仅在成功生成掩码时，才计算并累加 IoU 和 F1
+            iou, f1 = calculate_iou_f1(pred_mask, gt_mask)
             total_iou += iou
             total_f1 += f1
             valid_mask_samples += 1
@@ -219,26 +203,16 @@ def main():
     # 打印最终全局指标
     # =========================================================
     if valid_mask_samples > 0:
-        # 1. 计算 Macro-Average (逐图平均)
-        macro_iou = total_iou / valid_mask_samples
-        macro_f1 = total_f1 / valid_mask_samples
-
-        # 2. 计算 Micro-Average (全局像素平均)
-        micro_iou = global_intersection / global_union if global_union > 0 else 0.0
-        micro_f1 = (2 * global_intersection) / (global_pred_sum + global_gt_sum) if (global_pred_sum + global_gt_sum) > 0 else 0.0
+        mean_iou = total_iou / valid_mask_samples
+        mean_f1 = total_f1 / valid_mask_samples
         print("\n" + "="*50)
         print(" 🎯 伪造掩码分割评估最终结果 (Segmentation Metrics) 🎯")
         print("="*50)
         print(f"📌 参与测试总样本数: {total_samples} 张")
         print(f"✅ 成功生成掩码数  : {valid_mask_samples} 张")
         print(f"⚠️ 漏报次数 (未生成): {zero_mask_count} 次\n")
-        print("📊 [你的标准] Macro-Average (逐图平均):")
-        print(f"   ✅ Mean IoU : {macro_iou:.4f}")
-        print(f"   ✅ Mean F1  : {macro_f1:.4f}\n")
-
-        print("📊 [SIDA 标准] Micro-Average (全局像素平均):")
-        print(f"   🔥 Global IoU : {micro_iou:.4f}")
-        print(f"   🔥 Global F1  : {micro_f1:.4f}")
+        print(f"   ✅ Mean IoU (交并比, 剔除漏报) : {mean_iou:.4f}")
+        print(f"   ✅ Mean F1-Score (Dice, 剔除漏报): {mean_f1:.4f}")
         print("="*50)
     elif total_samples > 0:
         print("\n⚠️ 所有样本均漏报，未能成功生成任何掩码，无法计算 IoU 和 F1。")

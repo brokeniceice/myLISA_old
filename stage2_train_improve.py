@@ -41,13 +41,13 @@ def parse_args():
     parser.add_argument("--llm_version", type=str, default="/home/yz/myLISA/checkpoints/LISA-7B-v1")
     parser.add_argument("--vision_tower", type=str, default="openai/clip-vit-large-patch14")
     parser.add_argument("--npr_ckpt", type=str, default="./checkpoints/npr_stage1_augmented_best.pth")
-    parser.add_argument("--output_dir", type=str, default="./checkpoints_stage2/full_new_epoch2")
+    parser.add_argument("--output_dir", type=str, default="./checkpoints_stage2/full_epoch3_50hint")
 
 
-    parser.add_argument("--batch_size", type=int, default=16, help="显存不够必须设为1")
+    parser.add_argument("--batch_size", type=int, default=12, help="显存不够必须设为1")
     parser.add_argument("--grad_accum_steps", type=int, default=2, help="梯度累积步数，模拟大Batch")
     
-    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--ce_loss_weight", default=1.0, type=float)
     parser.add_argument("--dice_loss_weight", default=0.5, type=float)
@@ -77,6 +77,17 @@ def preprocess(
     padw = img_size - w
     x = F.pad(x, (0, padw, 0, padh))
     return x
+
+
+def sync_vocab_size_in_config(config, vocab_size):
+    config.vocab_size = vocab_size
+    text_config = getattr(config, "text_config", None)
+    if text_config is None:
+        return
+    if isinstance(text_config, dict):
+        text_config["vocab_size"] = vocab_size
+    else:
+        setattr(text_config, "vocab_size", vocab_size)
 
 # 定义分类头
 class NPRClassifierHead(nn.Module):
@@ -472,6 +483,8 @@ def main():
             print(f"{key:20s}: {count / 1e6:8.2f} M")
         print(f"\n📊 总可训练参数量: {total / 1e6:.2f} M")
     model.resize_token_embeddings(len(tokenizer))
+    sync_vocab_size_in_config(model.config, len(tokenizer))
+    sync_vocab_size_in_config(model.get_model().config, len(tokenizer))
 
     image_processor = CLIPImageProcessor.from_pretrained(args.vision_tower)
     train_dataset = AIGIDataset(train_data, tokenizer, image_processor, args.image_root)
@@ -707,6 +720,8 @@ def main():
             save_path = os.path.join(args.output_dir, f"epoch_{epoch+1}")
             os.makedirs(save_path, exist_ok=True)
             # 🔥 修改：解包后再保存
+            sync_vocab_size_in_config(accelerator.unwrap_model(model).config, len(tokenizer))
+            sync_vocab_size_in_config(accelerator.unwrap_model(model).get_model().config, len(tokenizer))
             accelerator.unwrap_model(model).save_pretrained(save_path)
             tokenizer.save_pretrained(save_path)
 
@@ -715,6 +730,8 @@ def main():
         os.makedirs(final_save_path, exist_ok=True)
         # 🔥 修改：解包后再 merge
         merged_model = accelerator.unwrap_model(model).merge_and_unload()
+        sync_vocab_size_in_config(merged_model.config, len(tokenizer))
+        sync_vocab_size_in_config(merged_model.get_model().config, len(tokenizer))
         full_state_dict = merged_model.state_dict()
         keys_to_save = {k: v.cpu() for k, v in full_state_dict.items() if "vision_tower" not in k}
         merged_model.save_pretrained(final_save_path, state_dict=keys_to_save)

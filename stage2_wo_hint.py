@@ -40,13 +40,13 @@ def parse_args():
     parser.add_argument("--llm_version", type=str, default="/home/yz/myLISA/checkpoints/LISA-7B-v1")
     parser.add_argument("--vision_tower", type=str, default="openai/clip-vit-large-patch14")
     parser.add_argument("--npr_ckpt", type=str, default="./checkpoints/npr_stage1_augmented_best.pth")
-    parser.add_argument("--output_dir", type=str, default="./checkpoints_stage2/wo_hint_epoch2")
+    parser.add_argument("--output_dir", type=str, default="./checkpoints_stage2/wo_hint_epoch6")
 
 
     parser.add_argument("--batch_size", type=int, default=16, help="显存不够必须设为1")
     parser.add_argument("--grad_accum_steps", type=int, default=2, help="梯度累积步数，模拟大Batch")
     
-    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--ce_loss_weight", default=1.0, type=float)
     parser.add_argument("--dice_loss_weight", default=0.5, type=float)
@@ -222,6 +222,25 @@ def collate_fn(batch, pad_token_id=0):
         "resize_list": resize_list   
     }
 
+def reserve_vram(device, reserve_gb=44):
+    """
+    预占指定大小的显存，防止被其他进程抢占。
+    参数:
+        device: 当前所在的 GPU device
+        reserve_gb: 需要预占的显存大小（GB）
+    """
+    try:
+        print(f"🔒 正在预占 {reserve_gb} GB 显存，建立 PyTorch 缓存池...")
+        # 1 GB = 1024^3 bytes。我们分配一个巨大的 int8 (1 byte) 的全零 Tensor
+        dummy_tensor = torch.empty(int(reserve_gb * (1024 ** 3)), dtype=torch.int8, device=device)
+        
+        # 核心操作：删除这个 Tensor
+        # 此时这 44GB 显存会回到 PyTorch 的 Caching Allocator 中
+        # nvidia-smi 依然会显示这部分显存被占用，其他人的进程进不来
+        del dummy_tensor
+        print(f"✅ 成功霸占 {reserve_gb} GB 显存！")
+    except RuntimeError as e:
+        print(f"❌ 预占显存失败，请检查当前 GPU 是否还有 {reserve_gb} GB 空闲显存。")
 
 # =========================
 # 主函数
@@ -235,6 +254,9 @@ def main():
         kwargs_handlers=[ddp_kwargs]
     )
     device = accelerator.device
+    if accelerator.is_main_process:
+        print("🛡️ 启动防 OOM 显存保护机制...")
+    reserve_vram(device, reserve_gb=46)
     time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     args.output_dir = f"{args.output_dir}_{time_str}"
 

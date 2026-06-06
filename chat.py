@@ -21,7 +21,7 @@ from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
 def parse_args(args):
     parser = argparse.ArgumentParser(description="LISA chat")
     # 🔥 修改 1: 默认路径指向你的合并模型
-    parser.add_argument("--version", default="./checkpoints_stage2/full_best/merged_final")
+    parser.add_argument("--version", default="./checkpoints_stage2/full_half_hint_epoch2/merged_final")
     parser.add_argument("--npr_ckpt", type=str, default="./checkpoints/npr_stage1_augmented_best.pth")
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
     parser.add_argument(
@@ -37,7 +37,7 @@ def parse_args(args):
     parser.add_argument(
         "--vision-tower", default="openai/clip-vit-large-patch14", type=str
     )
-    parser.add_argument("--local-rank", default=2, type=int, help="node rank")
+    parser.add_argument("--local-rank", default=0, type=int, help="node rank")
     parser.add_argument("--load_in_8bit", action="store_true", default=False)
     parser.add_argument("--load_in_4bit", action="store_true", default=False)
     parser.add_argument("--use_mm_start_end", action="store_true", default=True)
@@ -227,7 +227,10 @@ def main(args):
     while True:
         conv = conversation_lib.conv_templates[args.conv_type].copy()
         conv.messages = []
-
+        # prompt =input("Please input your prompt: ")
+        # if prompt.strip().lower() in ['exit', 'quit']:
+        #     print("👋 Exiting chat. Goodbye!")
+        #     break
         image_path = input("Please input the image path: ")
         if image_path.strip().lower() in ['exit', 'quit']:
             print("👋 Exiting chat. Goodbye!")
@@ -258,7 +261,7 @@ def main(args):
             image_npr = image_npr.float()
             
         prompt ="Please determine whether this image is fake or real, and provide the reasons for your judgment. If it is a fake image, please also segment the forged area."
-        prompt = prompt.rstrip() + "\n" + hint
+        prompt = prompt.rstrip() + "\n" + hint 
         prompt = prompt.rstrip() 
         # 兼容处理：确保 <image> 标签存在
         if DEFAULT_IMAGE_TOKEN not in prompt:
@@ -308,13 +311,13 @@ def main(args):
         input_ids = input_ids.unsqueeze(0).cuda().to(device)
         model.get_model().current_images_npr = image_npr
 
-        output_ids, pred_masks = model.evaluate(
+        output_ids, pred_masks = model.evaluate_analyse(
             image_clip,
             image,
             input_ids,
             resize_list,
             original_size_list,
-            max_new_tokens=1500,
+            max_new_tokens=8,
             tokenizer=tokenizer,
         )
         output_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]

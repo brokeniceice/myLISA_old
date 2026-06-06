@@ -10,10 +10,15 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 from PIL import Image
 from tqdm import tqdm
-from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
-from transformers import AutoTokenizer, CLIPImageProcessor, AutoConfig
+
+# NLP 评估指标库
+import nltk
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from rouge_score import rouge_scorer
+from bert_score import score as bert_score_fn
 
 # LISA 相关导入
+from transformers import AutoTokenizer, CLIPImageProcessor, AutoConfig
 from model.LISA import LISAForCausalLM
 from model.llava.model.resnet_expert import ResNetExpert
 from model.llava import conversation as conversation_lib
@@ -22,21 +27,16 @@ from model.segment_anything.utils.transforms import ResizeLongestSide
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX)
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="LISA Classification Evaluation")
-    parser.add_argument("--test_json", type=str, default="./datasets/AIGI-Holmes-Dataset/dataset/test_mini_400.jsonl")
-    parser.add_argument("--image_root", type=str, default="./datasets/AIGI-Holmes-Dataset")
-    parser.add_argument("--version", default="./checkpoints_stage2/full_half_hint_epoch2/merged_final")
-    parser.add_argument("--precision", default="bf16", type=str, choices=["fp32", "bf16", "fp16"])
-    parser.add_argument("--image_size", default=1024, type=int)
-    parser.add_argument("--model_max_length", default=2048, type=int)
-    parser.add_argument("--vision-tower", default="openai/clip-vit-large-patch14", type=str)
-    parser.add_argument("--npr_ckpt", type=str, default="./checkpoints/npr_stage1_augmented_best.pth")
-    parser.add_argument("--local-rank", default=2, type=int)
-    parser.add_argument("--use_mm_start_end", action="store_true", default=True)
-    parser.add_argument("--conv_type", default="llava_v1", type=str)
-    return parser.parse_args()
+# 确保 nltk 词典已下载 (用于分词)
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
 
+
+# ==========================================
+# 专家网络定义 (NPR Expert)
+# ==========================================
 class NPRClassifierHead(nn.Module):
     def __init__(self, input_dim=512, num_classes=2):
         super().__init__()
@@ -57,9 +57,9 @@ class UnifiedNPRExpert(nn.Module):
         if ckpt_path is not None:
             print(f"✅ Loading pretrained NPR expert from {ckpt_path}")
             checkpoint = torch.load(ckpt_path, map_location="cpu")
-            msg1=self.resnet.load_state_dict(checkpoint['resnet'], strict=True)
-            msg2=self.classifier.load_state_dict(checkpoint['classifier'], strict=True)
-            print(f"✅ renset加载结果: {msg1} | classifier加载结果: {msg2}")
+            msg1 = self.resnet.load_state_dict(checkpoint['resnet'], strict=True)
+            msg2 = self.classifier.load_state_dict(checkpoint['classifier'], strict=True)
+            print(f"✅ resnet加载结果: {msg1} | classifier加载结果: {msg2}")
         for param in self.parameters():
             param.requires_grad = False
             
@@ -82,29 +82,44 @@ def preprocess(
     x = F.pad(x, (0, padw, 0, padh))
     return x
 
-def extract_predicted_class(text):
-    """精准提取：匹配完整的预设句子"""
-    text_lower = text.lower().strip()
-    if "this is a fake image" in text_lower:
-        return 1
-    elif "this is a real image" in text_lower:
-        return 0
-        
-    if "fake" in text_lower: return 1
-    if "real" in text_lower: return 0
-    return 0 
+def parse_args():
+    parser = argparse.ArgumentParser(description="LISA Text Explanation Evaluation")
+    # 🔥 默认测试集改为了你的 test_text.jsonl
+    parser.add_argument("--test_json", type=str, default="./datasets/AIGI-Holmes-Dataset/dataset/test_mini_400.jsonl")
+    parser.add_argument("--image_root", type=str, default="./datasets/AIGI-Holmes-Dataset")
+    parser.add_argument("--version", default="./checkpoints_stage2/my_best_model/merged_final")
+    parser.add_argument("--precision", default="bf16", type=str, choices=["fp32", "bf16", "fp16"])
+    parser.add_argument("--image_size", default=1024, type=int)
+    parser.add_argument("--model_max_length", default=2048, type=int)
+    parser.add_argument("--vision-tower", default="openai/clip-vit-large-patch14", type=str)
+    parser.add_argument("--npr_ckpt", type=str, default="./checkpoints/npr_stage1_augmented_best.pth")
+    parser.add_argument("--local-rank", default=0, type=int)
+    parser.add_argument("--use_mm_start_end", action="store_true", default=True)
+    parser.add_argument("--conv_type", default="llava_v1", type=str)
+    return parser.parse_args()
+
 
 def main():
     args = parse_args()
     device = torch.device(f"cuda:{args.local_rank}" if torch.cuda.is_available() else "cpu")
 
+    # ==========================================
+    # 1. 读取数据
+    # ==========================================
     print(f"📂 读取测试集文件: {args.test_json}")
     test_data = []
     with open(args.test_json, 'r', encoding='utf-8') as f:
         for line in f:
-            if line.strip(): test_data.append(json.loads(line))
+            if line.strip(): 
+                item = json.loads(line)
+                if "response" in item: # 确保有真实文本用于对比
+                    test_data.append(item)
+    print(f"✅ 找到 {len(test_data)} 条包含 Ground Truth 文本的样本。")
 
-    print("🧠 正在初始化独立 NPR 专家网络进行提示词生成...")
+    # ==========================================
+    # 2. 注入专家提示词 (Expert Hint)
+    # ==========================================
+    print("\n🧠 正在初始化独立 NPR 专家网络进行提示词生成...")
     expert_model = UnifiedNPRExpert(ckpt_path=args.npr_ckpt).to(device)
     expert_model.eval()
     npr_transform = transforms.Compose([
@@ -116,6 +131,7 @@ def main():
             std=[0.26862954, 0.26130258, 0.27577711]
         )
     ])
+    
     batch_size = 32
     for i in tqdm(range(0, len(test_data), batch_size), desc="Injecting Expert Hints"):
         batch_items = test_data[i : i + batch_size]
@@ -135,7 +151,7 @@ def main():
                 img_tensors.append(npr_transform(pil_img))
                 valid_indices.append(idx)
             except Exception:
-                print("未读取到图片！！！")
+                print(f"未读取到图片！！！路径: {img_path}")
                 batch_items[idx]["expert_hint"] = "[System Forensic Expert Hint: Failed to analyze low-level pixels.]"
         
         if img_tensors:
@@ -151,13 +167,14 @@ def main():
                     hint = "[System Forensic Expert Hint: Low-level pixel analysis indicates this is a natural image with no forged traces detected.]"
                 batch_items[valid_idx]["expert_hint"] = hint
 
-    # 🔥 释放专家模型，清空显存给 LISA 腾地方
+    # 释放专家模型
     del expert_model
     torch.cuda.empty_cache()
-    print("✅ 测试集专家提示词注入完成，显存已释放。")
+    print("✅ 测试集专家提示词注入完成，显存已释放。\n")
 
-    y_true_cls, y_pred_cls = [], []
-
+    # ==========================================
+    # 3. 加载 LISA (MLLM) 模型
+    # ==========================================
     print("🚀 初始化 Tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(
         args.version, cache_dir=None, model_max_length=args.model_max_length, padding_side="right", use_fast=False,
@@ -175,7 +192,7 @@ def main():
     cfg = AutoConfig.from_pretrained(args.version)
     cfg.npr_pretrained_path = None 
 
-    print("🚀 加载模型本体...")
+    print("🚀 加载 LISA 模型本体...")
     model = LISAForCausalLM.from_pretrained(
         args.version, config=cfg, low_cpu_mem_usage=True, vision_tower=args.vision_tower, seg_token_idx=args.seg_token_idx, torch_dtype=torch_dtype
     )
@@ -192,18 +209,18 @@ def main():
     clip_image_processor = CLIPImageProcessor.from_pretrained(model.config.vision_tower)
     transform = ResizeLongestSide(args.image_size)
     model.eval()
-    print("✅ 模型加载完毕，准备纯分类评估！")
+    print("✅ LISA 模型加载完毕，准备纯文本解释评估！\n")
 
+    # ==========================================
+    # 4. MLLM 推理生成长文本
+    # ==========================================
+    gt_texts = []
+    pred_texts = []
 
-    pbar = tqdm(test_data, desc="Evaluating Classification")
+    pbar = tqdm(test_data, desc="Generating Text Explanations")
     for idx, item in enumerate(pbar):
-        # --- 获取 GT 标签 (不读 Mask 图像，只看路径是否存在) ---
-        mask_path = item.get("mask", "")
-        if mask_path and len(mask_path.strip()) > 0:
-            gt_class = 1 # Fake
-        else:
-            gt_class = 0 # Real
-        y_true_cls.append(gt_class)
+        # --- 准备文本 GT ---
+        gt_text = item["response"]
 
         # --- 准备图像 ---
         raw_path = item["images"][0]
@@ -211,8 +228,6 @@ def main():
         img_path = os.path.join(args.image_root, clean_path)
         
         if not os.path.exists(img_path):
-            # 如果原图找不到，为了不打断评估，默认记一次错误预测
-            y_pred_cls.append(1 - gt_class) 
             continue
 
         image_np = cv2.imread(img_path)
@@ -226,7 +241,7 @@ def main():
         resize_list = [image.shape[:2]]
         image = preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous()).unsqueeze(0).to(device, dtype=torch_dtype)
 
-        
+        # --- 构建包含 Expert Hint 的 Prompt ---
         base_prompt = ("Please determine whether this image is fake or real, and provide the reasons for your judgment. If it is a fake image, please also segment the forged area.")
         expert_hint = item.get("expert_hint", "")
         prompt = base_prompt + "\n" + expert_hint
@@ -248,7 +263,8 @@ def main():
 
         input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors="pt").unsqueeze(0).to(device)
         model.get_model().current_images_npr = image_npr
-        # --- 模型推理 ---
+        
+        # --- 模型推理 (🔥 赋予极大的 Token 额度) ---
         with torch.no_grad():
             output_ids, _ = model.evaluate(
                 image_clip,
@@ -256,62 +272,84 @@ def main():
                 input_ids,
                 resize_list,
                 original_size_list,
-                max_new_tokens=7, 
+                max_new_tokens=1500,  # 🔥 调大至 2048，足够输出千字长文
                 tokenizer=tokenizer,
             )
             
-        # --- 解析文本分类 ---
+        # --- 解析生成的文本 ---
         output_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
-        text_output = tokenizer.decode(output_ids, skip_special_tokens=False)
-        if idx < 5:
-            gt_label_str = "Fake" if gt_class == 1 else "Real"
-            # 使用 tqdm.write 可以在不打断进度条显示的情况下打印信息
-            tqdm.write(f"\n[Sample {idx+1}] GT: {gt_label_str} | Output: {text_output.strip()}")
-        pred_class = extract_predicted_class(text_output)
-        y_pred_cls.append(pred_class)
+        # skip_special_tokens=True 会去掉 [CLS], [SEG] 等，留下纯人类语言
+        raw_pred_text = tokenizer.decode(output_ids, skip_special_tokens=False).strip()
 
-        # 实时更新总 ACC 进度
-        pbar.set_postfix({"Overall ACC": f"{accuracy_score(y_true_cls, y_pred_cls):.3f}"})
+        # 🔥 核心清洗逻辑：切掉冗长的 Prompt，只保留 Assistant 生成的纯净回答
+        # 动态获取当前 conversation 模板中 Assistant 的角色名 (通常是 'ASSISTANT:')
+        assistant_marker = conv.roles[1] + ":" 
+        
+        if assistant_marker in raw_pred_text:
+            pred_text = raw_pred_text.split(assistant_marker)[-1].strip()
+        elif "ASSISTANT:" in raw_pred_text.upper(): # 增加鲁棒性防大小写问题
+            import re
+            pred_text = re.split(r'(?i)ASSISTANT:', raw_pred_text)[-1].strip()
+        else:
+            pred_text = raw_pred_text  # 兜底
+
+        # 收集用于计算指标
+        gt_texts.append(gt_text)
+        pred_texts.append(pred_text)
+
+        # 随机打印前几个作为检查
+        if idx < 3:
+            tqdm.write(f"\n[Sample {idx+1} Preview]")
+            tqdm.write(f"  GT  : {gt_text[:100]}...")
+            tqdm.write(f"  Pred: {pred_text[:100]}...")
 
 
-    # =============================================================
-    # 打印超级详细的分类指标
-    # =============================================================
-    # 1. 计算总指标
-    overall_acc = accuracy_score(y_true_cls, y_pred_cls)
-    overall_f1 = f1_score(y_true_cls, y_pred_cls, average='macro')
-
-    # 2. 计算各个类别的详细指标 (使用混淆矩阵和分类报告)
-    cm = confusion_matrix(y_true_cls, y_pred_cls)
-    # cm 结构:
-    # [ [True Negative (Real->Real), False Positive (Real->Fake)],
-    #   [False Negative (Fake->Real), True Positive (Fake->Fake)] ]
-    
-    real_acc = cm[0, 0] / (cm[0, 0] + cm[0, 1]) if (cm[0, 0] + cm[0, 1]) > 0 else 0
-    fake_acc = cm[1, 1] / (cm[1, 0] + cm[1, 1]) if (cm[1, 0] + cm[1, 1]) > 0 else 0
-
-    report = classification_report(y_true_cls, y_pred_cls, target_names=['Real (0)', 'Fake (1)'], output_dict=True)
-    real_f1 = report['Real (0)']['f1-score']
-    fake_f1 = report['Fake (1)']['f1-score']
+    # ==========================================
+    # 5. NLP 三大金刚指标计算
+    # ==========================================
+    if len(pred_texts) == 0:
+        print("没有成功生成的文本数据！")
+        return
 
     print("\n" + "="*50)
-    print(" 🏆 测试集评估最终结果 (分类专用) 🏆")
+    print(" 🧠 开始计算自然语言理解 (NLU) 指标...")
+    
+    # [A] BLEU-4
+    chencherry = SmoothingFunction().method1
+    bleu_scores = []
+    for ref, pred in zip(gt_texts, pred_texts):
+        ref_tokens = nltk.word_tokenize(ref)
+        pred_tokens = nltk.word_tokenize(pred)
+        b_score = sentence_bleu([ref_tokens], pred_tokens, smoothing_function=chencherry)
+        bleu_scores.append(b_score)
+    mean_bleu = np.mean(bleu_scores)
+    print(f"✅ BLEU-4 评分计算完成: {mean_bleu:.4f}")
+
+    # [B] ROUGE-L
+    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+    rouge_scores = []
+    for ref, pred in zip(gt_texts, pred_texts):
+        r_score = scorer.score(ref, pred)['rougeL'].fmeasure
+        rouge_scores.append(r_score)
+    mean_rouge = np.mean(rouge_scores)
+    print(f"✅ ROUGE-L 评分计算完成: {mean_rouge:.4f}")
+
+    # [C] BERTScore (余弦相似度)
+    print("⏳ 正在计算 BERTScore (Cosine Similarity)...")
+    P, R, F1 = bert_score_fn(pred_texts, gt_texts, lang="en", verbose=False)
+    mean_bertscore = F1.mean().item()
+    print(f"✅ BERTScore 评分计算完成: {mean_bertscore:.4f}")
+
+    # ==========================================
+    # 最终报告
+    # ==========================================
+    print("\n" + "="*50)
+    print(" 🎯 文本解释能力评估最终结果 (Text Explanations) 🎯")
     print("="*50)
-    print(f"📌 测试集总数据量: {len(y_true_cls)} 张")
-    print(f"   - 真实图像 (Real) 数量: {cm[0, 0] + cm[0, 1]}")
-    print(f"   - 伪造图像 (Fake) 数量: {cm[1, 0] + cm[1, 1]}\n")
-
-    print("📊 总体指标 (Overall Metrics):")
-    print(f"   ✅ Total Accuracy (ACC) : {overall_acc:.4f}")
-    print(f"   ✅ Total F1-Score (Macro): {overall_f1:.4f}\n")
-
-    print("🟢 真实图像指标 (Real Class Metrics):")
-    print(f"   ✅ Real Accuracy (Recall): {real_acc:.4f}  <- (准确认出真图的比例)")
-    print(f"   ✅ Real F1-Score         : {real_f1:.4f}\n")
-
-    print("🔴 伪造图像指标 (Fake Class Metrics):")
-    print(f"   ✅ Fake Accuracy (Recall): {fake_acc:.4f}  <- (准确抓出假图的比例)")
-    print(f"   ✅ Fake F1-Score         : {fake_f1:.4f}")
+    print(f"📌 参与测试总样本数: {len(pred_texts)} 张")
+    print(f"   🔹 Mean BLEU-4   (传统字面匹配): {mean_bleu:.4f}")
+    print(f"   🔹 Mean ROUGE-L  (序列结构匹配): {mean_rouge:.4f}")
+    print(f"   🔥 BERTScore-F1 (余弦语义相似度): {mean_bertscore:.4f}  <-- 最重要指标！")
     print("="*50)
 
 if __name__ == "__main__":

@@ -52,12 +52,12 @@ class Conversation:
                     ret += role + ":"
         elif self.sep_style == SeparatorStyle.TWO:
             seps = [self.sep, self.sep2]
-            ret = self.system + seps[0]
+            ret = self.system + "\n"
             for i, (role, message) in enumerate(messages):
                 if message:
                     if type(message) is tuple:
                         message, _, _ = message
-                    ret += role + ": " + message + seps[i % 2]
+                    ret += role + ": " + message + seps[i % 2] + "\n"
                 else:
                     ret += role + ":"
         elif self.sep_style == SeparatorStyle.MPT:

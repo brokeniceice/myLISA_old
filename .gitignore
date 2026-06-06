@@ -6,3 +6,5 @@ eval_aigc_cls.py
 eval_aigc_seg.py
 sample_mini_test.py
 __pycache__/
+checkpoints_stage2
+datasets

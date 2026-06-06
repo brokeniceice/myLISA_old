@@ -13,7 +13,6 @@ class ResNetExpert(nn.Module):
         weights = ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
         
         # 2. 加载完整的 ResNet50 (包含权重)
-        # 这一步会自动处理权重的下载和加载，不需要外部干预
         full_resnet = resnet50(weights=weights)
         
         if pretrained:
@@ -64,7 +63,7 @@ class ResNetExpert(nn.Module):
 
         # 正常的 ResNet 前向传播
         features = self.backbone(x)
-        features = self.spatial_pool(features) # 瞬间变成 [B, 512, 16, 16]
+        features = self.spatial_pool(features) # 变成 [B, 512, 16, 16]
         # x = self.avgpool(x)
         # x = torch.flatten(x, 1)
         # x = self.fc(x)
