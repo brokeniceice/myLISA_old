@@ -508,6 +508,117 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                 pred_masks.append(pred_mask[:, 0])
 
         return output_ids, pred_masks
+    
+    def evaluate_stream(
+        self,
+        images_clip,
+        images,
+        input_ids,
+        resize_list,
+        original_size_list,
+        max_new_tokens=32,
+        tokenizer=None,
+        **kwargs
+    ):
+        with torch.no_grad():
+            outputs = self.generate(
+                images=images_clip,
+                input_ids=input_ids,
+                max_new_tokens=max_new_tokens,
+                eos_token_id=tokenizer.eos_token_id, 
+                pad_token_id=tokenizer.pad_token_id,
+                num_beams=1,
+                output_hidden_states=True,
+                return_dict_in_generate=True,
+                **kwargs
+            )
+            if isinstance(outputs.hidden_states, tuple):
+                all_hidden_states = []
+                for step_states in outputs.hidden_states:
+                    # 如果返回的是 tuple (包含每一层的输出)，取最后一层
+                    if isinstance(step_states, (tuple, list)):
+                        h = step_states[-1]
+                    # 如果返回的已经是 tensor (直接是最后一层的输出)，直接使用
+                    else:
+                        h = step_states
+                    
+                    # 防御性补丁：如果被意外切成了 2 维 (seq_len, hidden_dim)
+                    # 强行给它补回第 0 维的 batch_size: (1, seq_len, hidden_dim)
+                    if h.dim() == 2:
+                        h = h.unsqueeze(0)
+                        
+                    all_hidden_states.append(h)
+                # 沿着序列长度维度 (dim=1) 完美拼接
+                output_hidden_states = torch.cat(all_hidden_states, dim=1)
+            else:
+                output_hidden_states = outputs.hidden_states[-1]
+            # =========================================================
+            
+            output_ids = outputs.sequences
+
+            seg_token_mask = output_ids[:, 1:] == self.seg_token_idx
+            prompt_len = input_ids.shape[1]
+            seg_token_mask[:, :prompt_len - 1] = False
+            # hack for IMAGE_TOKEN_INDEX (we suppose that there is only one image, and it is in the front)
+            seg_token_mask = torch.cat(
+                [
+                    torch.zeros((seg_token_mask.shape[0], 255), dtype=torch.bool, device=seg_token_mask.device), #消融情况下是255,Ours是511
+                    seg_token_mask,
+                ],
+                dim=1,
+            )
+
+            hidden_states = []
+
+            assert len(self.model.text_hidden_fcs) == 1
+            hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states))
+
+            last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
+            pred_embeddings = last_hidden_state[seg_token_mask]
+
+            seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
+            seg_token_offset = seg_token_counts.cumsum(-1)
+            seg_token_offset = torch.cat(
+                [torch.zeros(1, dtype=torch.long, device=seg_token_offset.device), seg_token_offset], dim=0
+            )
+
+            pred_embeddings_ = []
+            for i in range(len(seg_token_offset) - 1):
+                start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
+                pred_embeddings_.append(pred_embeddings[start_i:end_i])
+            pred_embeddings = pred_embeddings_
+
+            image_embeddings = self.get_visual_embs(images)
+
+            multimask_output = False
+            pred_masks = []
+            for i in range(len(pred_embeddings)):
+                (
+                    sparse_embeddings,
+                    dense_embeddings,
+                ) = self.model.visual_model.prompt_encoder(
+                    points=None,
+                    boxes=None,
+                    masks=None,
+                    text_embeds=pred_embeddings[i].unsqueeze(1),
+                )
+
+                sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
+                low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
+                    image_embeddings=image_embeddings[i].unsqueeze(0),
+                    image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
+                    sparse_prompt_embeddings=sparse_embeddings,
+                    dense_prompt_embeddings=dense_embeddings,
+                    multimask_output=multimask_output,
+                )
+                pred_mask = self.model.visual_model.postprocess_masks(
+                    low_res_masks,
+                    input_size=resize_list[i],
+                    original_size=original_size_list[i],
+                )
+                pred_masks.append(pred_mask[:, 0])
+
+        return output_ids, pred_masks
 
     def evaluate_analyse(
         self,

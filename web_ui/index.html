@@ -1,0 +1,1506 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIGC 图像取证工作台</title>
+    <style>
+        :root {
+            --bg: #f4f1e9;
+            --panel: rgba(255, 255, 255, 0.92);
+            --panel-strong: #fffdf9;
+            --line: rgba(92, 78, 58, 0.16);
+            --line-strong: rgba(92, 78, 58, 0.28);
+            --text: #16181d;
+            --muted: #606a76;
+            --quiet: #8a8278;
+            --cyan: #007a6d;
+            --cyan-soft: rgba(0, 122, 109, 0.1);
+            --amber: #c98307;
+            --amber-soft: rgba(201, 131, 7, 0.12);
+            --red: #c93535;
+            --red-soft: rgba(201, 53, 53, 0.11);
+            --green: #118956;
+            --green-soft: rgba(17, 137, 86, 0.11);
+            --shadow: 0 22px 70px rgba(54, 45, 32, 0.14);
+
+            /* 统一调整左右取证主体高度：后续只改这一行。 */
+            --forensic-zone-height: clamp(560px, calc(100vh - 230px), 720px);
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        html {
+            min-height: 100%;
+            background: var(--bg);
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            color: var(--text);
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+            background:
+                linear-gradient(rgba(92, 78, 58, 0.055) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(92, 78, 58, 0.055) 1px, transparent 1px),
+                linear-gradient(135deg, #f8f6f0 0%, #f4f1e9 46%, #ece6dc 100%);
+            background-size: 32px 32px, 32px 32px, 100% 100%;
+            letter-spacing: 0;
+        }
+
+        button,
+        input {
+            font: inherit;
+        }
+
+        button {
+            border: 0;
+        }
+
+        [hidden] {
+            display: none !important;
+        }
+
+        .app-shell {
+            width: min(1440px, calc(100vw - 40px));
+            min-height: 100vh;
+            margin: 0 auto;
+            padding: 24px 0 32px;
+        }
+
+        .topbar {
+            display: grid;
+            grid-template-columns: auto 1fr auto;
+            gap: 18px;
+            align-items: center;
+            padding: 16px 0 22px;
+        }
+
+        .brand-mark {
+            display: grid;
+            place-items: center;
+            width: 54px;
+            height: 54px;
+            border: 1px solid var(--line-strong);
+            border-radius: 8px;
+            color: var(--cyan);
+            background: linear-gradient(145deg, rgba(40, 215, 197, 0.16), rgba(245, 184, 75, 0.08));
+            font-weight: 900;
+            letter-spacing: 0.04em;
+        }
+
+        .topbar h1 {
+            margin: 0;
+            font-size: clamp(26px, 3.4vw, 44px);
+            line-height: 1.05;
+            font-weight: 900;
+        }
+
+        .topbar p {
+            margin: 8px 0 0;
+            color: var(--muted);
+            font-size: 14px;
+        }
+
+        .engine-status {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            min-width: 178px;
+            justify-content: center;
+            padding: 12px 14px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.72);
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .status-dot {
+            width: 9px;
+            height: 9px;
+            border-radius: 999px;
+            background: var(--green);
+            box-shadow: 0 0 18px rgba(61, 220, 151, 0.9);
+        }
+
+        .workspace {
+            display: grid;
+            grid-template-columns: minmax(420px, 0.9fr) minmax(520px, 1.1fr);
+            gap: 22px;
+            align-items: start;
+        }
+
+        .panel {
+            min-width: 0;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: var(--panel);
+            box-shadow: var(--shadow);
+            overflow: hidden;
+        }
+
+        .panel-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            min-height: 72px;
+            padding: 18px 20px;
+            border-bottom: 1px solid var(--line);
+            background: rgba(255, 255, 255, 0.62);
+        }
+
+        .panel-head h2 {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin: 0;
+            font-size: 18px;
+            font-weight: 850;
+        }
+
+        .panel-head h2::before {
+            content: "";
+            width: 8px;
+            height: 28px;
+            border-radius: 8px;
+            background: var(--cyan);
+            box-shadow: 0 0 18px rgba(40, 215, 197, 0.55);
+        }
+
+        .file-chip,
+        .case-chip {
+            max-width: 52%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            padding: 8px 10px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.68);
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        .evidence-panel {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .evidence-body {
+            display: flex;
+            height: var(--forensic-zone-height);
+            min-height: 0;
+            flex: 0 0 auto;
+            flex-direction: column;
+            gap: 16px;
+            overflow: hidden;
+            padding: 20px;
+        }
+
+        .upload-area {
+            display: flex;
+            height: auto;
+            min-height: 0;
+            flex: 1 1 auto;
+            align-items: center;
+            justify-content: center;
+            border: 1px dashed rgba(92, 78, 58, 0.28);
+            border-radius: 8px;
+            background:
+                linear-gradient(135deg, rgba(0, 122, 109, 0.08), transparent 34%),
+                linear-gradient(315deg, rgba(201, 131, 7, 0.08), transparent 40%),
+                rgba(255, 255, 255, 0.54);
+            cursor: pointer;
+            transition: border-color 160ms ease, background 160ms ease, transform 160ms ease;
+        }
+
+        .upload-area:hover,
+        .upload-area.is-dragging {
+            border-color: rgba(40, 215, 197, 0.7);
+            background:
+                linear-gradient(135deg, rgba(0, 122, 109, 0.12), transparent 34%),
+                linear-gradient(315deg, rgba(201, 131, 7, 0.11), transparent 40%),
+                rgba(255, 255, 255, 0.72);
+        }
+
+        .upload-empty {
+            display: grid;
+            gap: 14px;
+            justify-items: center;
+            padding: 26px;
+            text-align: center;
+        }
+
+        .upload-icon {
+            display: grid;
+            place-items: center;
+            width: 66px;
+            height: 66px;
+            border: 1px solid rgba(40, 215, 197, 0.42);
+            border-radius: 8px;
+            background: var(--cyan-soft);
+            color: var(--cyan);
+        }
+
+        .upload-empty strong {
+            display: block;
+            font-size: 20px;
+        }
+
+        .upload-empty span {
+            display: block;
+            color: var(--muted);
+            font-size: 14px;
+        }
+
+        .image-stage {
+            position: relative;
+            display: flex;
+            height: auto;
+            min-height: 0;
+            flex: 1 1 auto;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+            padding: 12px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background:
+                linear-gradient(45deg, rgba(92, 78, 58, 0.07) 25%, transparent 25%),
+                linear-gradient(-45deg, rgba(92, 78, 58, 0.07) 25%, transparent 25%),
+                linear-gradient(45deg, transparent 75%, rgba(92, 78, 58, 0.07) 75%),
+                linear-gradient(-45deg, transparent 75%, rgba(92, 78, 58, 0.07) 75%),
+                #fbfaf7;
+            background-position: 0 0, 0 10px, 10px -10px, -10px 0;
+            background-size: 20px 20px;
+        }
+
+        .evidence-image {
+            width: auto;
+            height: auto;
+            min-width: 0;
+            min-height: 0;
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            display: block;
+        }
+
+        .scan-layer {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            background:
+                linear-gradient(rgba(40, 215, 197, 0.08) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(40, 215, 197, 0.08) 1px, transparent 1px);
+            background-size: 40px 40px;
+        }
+
+        .scan-layer::after {
+            content: "";
+            position: absolute;
+            left: 0;
+            top: -12%;
+            width: 100%;
+            height: 3px;
+            background: var(--cyan);
+            box-shadow: 0 0 18px rgba(40, 215, 197, 0.85), 0 0 42px rgba(40, 215, 197, 0.38);
+            animation: scan-line 2.4s ease-in-out infinite;
+        }
+
+        @keyframes scan-line {
+            0% { transform: translateY(0); opacity: 0; }
+            10% { opacity: 1; }
+            90% { opacity: 1; }
+            100% { transform: translateY(620px); opacity: 0; }
+        }
+
+        .image-badge {
+            position: absolute;
+            left: 14px;
+            top: 14px;
+            padding: 8px 10px;
+            border: 1px solid rgba(240, 82, 82, 0.55);
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.88);
+            color: #8f1f1f;
+            font-size: 12px;
+            backdrop-filter: blur(12px);
+        }
+
+        .image-toolbar {
+            position: absolute;
+            right: 14px;
+            bottom: 14px;
+            display: inline-flex;
+            gap: 6px;
+            padding: 6px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.88);
+            backdrop-filter: blur(12px);
+        }
+
+        .tool-btn {
+            min-width: 58px;
+            min-height: 34px;
+            padding: 7px 10px;
+            border-radius: 6px;
+            color: var(--muted);
+            background: transparent;
+            cursor: pointer;
+        }
+
+        .tool-btn:hover:not(:disabled),
+        .tool-btn.is-active {
+            color: var(--text);
+            background: rgba(22, 24, 29, 0.08);
+        }
+
+        .tool-btn:disabled {
+            cursor: not-allowed;
+            opacity: 0.45;
+        }
+
+        .action-row {
+            display: grid;
+            flex: 0 0 auto;
+            grid-template-columns: 1fr auto;
+            gap: 10px;
+        }
+
+        .primary-btn,
+        .report-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            min-height: 48px;
+            border-radius: 8px;
+            color: #08100f;
+            background: var(--cyan);
+            font-weight: 850;
+            cursor: pointer;
+            transition: transform 140ms ease, filter 140ms ease, opacity 140ms ease;
+        }
+
+        .primary-btn {
+            width: 100%;
+            padding: 0 18px;
+        }
+
+        .primary-btn:hover:not(:disabled),
+        .report-btn:hover:not(:disabled) {
+            transform: translateY(-1px);
+            filter: brightness(1.08);
+        }
+
+        .primary-btn:disabled,
+        .report-btn:disabled {
+            cursor: not-allowed;
+            opacity: 0.45;
+            transform: none;
+        }
+
+        .icon-btn {
+            display: inline-grid;
+            width: 48px;
+            height: 48px;
+            place-items: center;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.78);
+            color: var(--muted);
+            cursor: pointer;
+        }
+
+        .icon-btn:hover:not(:disabled) {
+            color: var(--text);
+            border-color: var(--line-strong);
+        }
+
+        .icon-btn:disabled {
+            cursor: not-allowed;
+            opacity: 0.4;
+        }
+
+        .result-panel {
+            display: flex;
+            min-height: 0;
+            flex-direction: column;
+        }
+
+        .result-body {
+            display: flex;
+            height: var(--forensic-zone-height);
+            min-height: 0;
+            flex: 0 0 auto;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .verdict-strip {
+            display: grid;
+            flex: 0 0 auto;
+            grid-template-columns: 1fr minmax(160px, 210px);
+            gap: 18px;
+            align-items: center;
+            padding: 24px 24px 22px;
+            border-bottom: 1px solid var(--line);
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.74), rgba(255, 255, 255, 0.34));
+        }
+
+        .verdict-main {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            min-width: 0;
+        }
+
+        .verdict-symbol {
+            display: grid;
+            width: 62px;
+            height: 62px;
+            flex: 0 0 auto;
+            place-items: center;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            color: var(--muted);
+            background: rgba(255, 255, 255, 0.7);
+        }
+
+        .verdict-title {
+            margin: 0;
+            font-size: clamp(28px, 4vw, 46px);
+            line-height: 1;
+            font-weight: 950;
+        }
+
+        .verdict-subtitle {
+            margin: 10px 0 0;
+            color: var(--muted);
+            font-size: 14px;
+        }
+
+        .verdict-strip[data-state="aigc"] .verdict-symbol,
+        .verdict-strip[data-state="aigc"] .verdict-title {
+            color: #8f1f1f;
+        }
+
+        .verdict-strip[data-state="aigc"] {
+            background: linear-gradient(135deg, var(--red-soft), rgba(255, 255, 255, 0.015));
+        }
+
+        .verdict-strip[data-state="real"] .verdict-symbol,
+        .verdict-strip[data-state="real"] .verdict-title {
+            color: #11693f;
+        }
+
+        .verdict-strip[data-state="real"] {
+            background: linear-gradient(135deg, var(--green-soft), rgba(255, 255, 255, 0.015));
+        }
+
+        .verdict-strip[data-state="running"] {
+            background: linear-gradient(135deg, var(--amber-soft), rgba(255, 255, 255, 0.015));
+        }
+
+        .confidence-box {
+            display: grid;
+            gap: 9px;
+            justify-items: end;
+        }
+
+        .confidence-value {
+            font-size: 36px;
+            line-height: 1;
+            font-weight: 950;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .confidence-label {
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .meter {
+            width: 100%;
+            height: 8px;
+            overflow: hidden;
+            border-radius: 999px;
+            background: rgba(22, 24, 29, 0.08);
+        }
+
+        .meter-fill {
+            width: 0%;
+            height: 100%;
+            border-radius: inherit;
+            background: var(--cyan);
+            transition: width 280ms ease, background 180ms ease;
+        }
+
+        .verdict-strip[data-state="aigc"] .meter-fill {
+            background: var(--red);
+        }
+
+        .verdict-strip[data-state="real"] .meter-fill {
+            background: var(--green);
+        }
+
+        .verdict-strip[data-state="running"] .meter-fill {
+            background: var(--amber);
+        }
+
+        .result-facts {
+            display: grid;
+            flex: 0 0 auto;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            border-bottom: 1px solid var(--line);
+        }
+
+        .fact {
+            min-width: 0;
+            padding: 16px 18px;
+            border-right: 1px solid var(--line);
+        }
+
+        .fact:last-child {
+            border-right: 0;
+        }
+
+        .fact span {
+            display: block;
+            color: var(--quiet);
+            font-size: 12px;
+        }
+
+        .fact strong {
+            display: block;
+            overflow: hidden;
+            margin-top: 8px;
+            color: var(--text);
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-size: 14px;
+            font-weight: 750;
+        }
+
+        .analysis-console {
+            display: flex;
+            min-height: 0;
+            flex: 1 1 auto;
+            flex-direction: column;
+            overflow: hidden;
+            padding: 18px 20px 20px;
+        }
+
+        .section-title {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 12px;
+            color: var(--muted);
+            font-size: 13px;
+            font-weight: 780;
+            letter-spacing: 0.04em;
+        }
+
+        .analysis-actions {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .language-toggle {
+            display: inline-flex;
+            gap: 4px;
+            padding: 4px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.72);
+        }
+
+        .language-btn {
+            min-width: 68px;
+            min-height: 28px;
+            padding: 5px 10px;
+            border-radius: 6px;
+            color: var(--muted);
+            background: transparent;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 750;
+        }
+
+        .language-btn.is-active,
+        .language-btn:hover {
+            color: #fff;
+            background: var(--cyan);
+        }
+
+        .stream-state {
+            color: var(--quiet);
+            font-weight: 500;
+            letter-spacing: 0;
+        }
+
+        .analysis-output {
+            height: auto;
+            min-height: 0;
+            flex: 1 1 auto;
+            overflow: auto;
+            padding: 20px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: rgba(255, 253, 249, 0.88);
+            color: var(--text);
+        }
+
+        .analysis-output p {
+            margin: 0 0 14px;
+            color: #303842;
+            line-height: 1.72;
+            font-size: 15px;
+            white-space: pre-wrap;
+        }
+
+        .analysis-output h3 {
+            margin: 4px 0 14px;
+            color: var(--amber);
+            font-size: 18px;
+        }
+
+        .analysis-output strong {
+            color: var(--cyan);
+            font-weight: 800;
+        }
+
+        .analysis-output blockquote {
+            margin: 0 0 14px;
+            padding: 10px 12px;
+            border-left: 3px solid var(--cyan);
+            border-radius: 0 8px 8px 0;
+            background: rgba(40, 215, 197, 0.08);
+            color: var(--muted);
+            white-space: pre-wrap;
+        }
+
+        .empty-message {
+            display: grid;
+            min-height: 260px;
+            place-items: center;
+            color: var(--quiet);
+            text-align: center;
+        }
+
+        .typing-cursor {
+            display: inline-block;
+            width: 8px;
+            height: 18px;
+            margin-left: 3px;
+            transform: translateY(3px);
+            background: var(--cyan);
+            animation: blink 900ms steps(2, start) infinite;
+        }
+
+        @keyframes blink {
+            50% { opacity: 0; }
+        }
+
+        .report-bar {
+            display: flex;
+            flex: 0 0 auto;
+            justify-content: flex-end;
+            padding: 0 20px 20px;
+        }
+
+        .report-btn {
+            min-width: 178px;
+            padding: 0 18px;
+            background: var(--amber);
+        }
+
+        .spinner {
+            width: 18px;
+            height: 18px;
+            border: 2px solid rgba(8, 16, 15, 0.25);
+            border-top-color: #08100f;
+            border-radius: 50%;
+            animation: spin 760ms linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .sr-only {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            padding: 0;
+            overflow: hidden;
+            clip: rect(0, 0, 0, 0);
+            white-space: nowrap;
+            border: 0;
+        }
+
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            border-radius: 999px;
+            background: rgba(166, 173, 184, 0.35);
+        }
+
+        @media (max-width: 1080px) {
+            .workspace {
+                grid-template-columns: 1fr;
+            }
+
+            .result-panel {
+                min-height: 620px;
+            }
+        }
+
+        @media (max-width: 720px) {
+            .app-shell {
+                width: min(100vw - 24px, 1440px);
+                padding-top: 14px;
+            }
+
+            .topbar {
+                grid-template-columns: auto 1fr;
+            }
+
+            .engine-status {
+                grid-column: 1 / -1;
+                justify-content: flex-start;
+            }
+
+            .panel-head,
+            .verdict-strip {
+                grid-template-columns: 1fr;
+            }
+
+            .file-chip,
+            .case-chip {
+                max-width: 100%;
+            }
+
+            .upload-area,
+            .image-stage {
+                min-height: 360px;
+            }
+
+            .result-facts {
+                grid-template-columns: 1fr;
+            }
+
+            .fact {
+                border-right: 0;
+                border-bottom: 1px solid var(--line);
+            }
+
+            .fact:last-child {
+                border-bottom: 0;
+            }
+
+            .confidence-box {
+                justify-items: start;
+            }
+
+            .image-toolbar {
+                left: 14px;
+                right: auto;
+                max-width: calc(100% - 28px);
+                overflow-x: auto;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="app-shell">
+        <header class="topbar">
+            <div class="brand-mark">LISA</div>
+            <div>
+                <h1>AIGC 图像取证工作台</h1>
+                <p>AIGC 图像检测 · 细粒度伪造区域定位 · 可解释文本输出</p>
+            </div>
+            <div class="engine-status">
+                <span class="status-dot"></span>
+                <span>NPR Expert · LISA Online</span>
+            </div>
+        </header>
+
+        <main class="workspace">
+            <section class="panel evidence-panel" aria-label="输入检材">
+                <div class="panel-head">
+                    <h2>输入待测图像</h2>
+                    <div id="fileChip" class="file-chip">未选择图像</div>
+                </div>
+
+                <div class="evidence-body">
+                    <label id="uploadArea" class="upload-area">
+                        <input id="imageInput" class="sr-only" type="file" accept="image/*">
+                        <span class="upload-empty">
+                            <span class="upload-icon" aria-hidden="true">
+                                <svg width="66" height="66" viewBox="0 0 24 24" fill="none">
+                                    <path d="M12 16V4m0 0 4.5 4.5M12 4 7.5 8.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                                    <path d="M4 15.5V18a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                                </svg>
+                            </span>
+                            <strong>上传待测图像</strong>
+                            <span>支持 JPG、PNG、WEBP，拖拽或点击选择</span>
+                        </span>
+                    </label>
+
+                    <div id="imageStage" class="image-stage" hidden>
+                        <img id="previewImage" class="evidence-image" alt="上传图像预览">
+                        <div id="scanLayer" class="scan-layer" hidden></div>
+                        <div id="overlayBadge" class="image-badge" hidden>红色区域为模型定位的显著伪造区域</div>
+                        <div class="image-toolbar" aria-label="图像视图切换">
+                            <button id="showOriginalBtn" class="tool-btn is-active" type="button">原图</button>
+                            <button id="showOverlayBtn" class="tool-btn" type="button" disabled>取证图</button>
+                            <button id="resetBtn" class="tool-btn" type="button">重选</button>
+                        </div>
+                    </div>
+
+                    <div class="action-row">
+                        <button id="analyzeBtn" class="primary-btn" type="button" disabled>
+                            <span id="analyzeIcon" aria-hidden="true">
+                                <svg width="19" height="19" viewBox="0 0 24 24" fill="none">
+                                    <path d="M4 12h4l2-7 4 14 2-7h4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                </svg>
+                            </span>
+                            <span id="analyzeText">开始鉴定</span>
+                        </button>
+                        <button id="clearBtn" class="icon-btn" type="button" disabled aria-label="清空图像">
+                            <svg width="19" height="19" viewBox="0 0 24 24" fill="none">
+                                <path d="m6 6 12 12M18 6 6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+            </section>
+
+            <section class="panel result-panel" aria-label="取证结果">
+                <div class="panel-head">
+                    <h2>取证结果</h2>
+                    <div id="caseChip" class="case-chip">CASE 待生成</div>
+                </div>
+
+                <div class="result-body">
+                    <section id="verdictStrip" class="verdict-strip" data-state="idle">
+                        <div class="verdict-main">
+                            <div id="verdictSymbol" class="verdict-symbol" aria-hidden="true">
+                                <svg width="30" height="30" viewBox="0 0 24 24" fill="none">
+                                    <path d="M12 3 4.5 6v5.5c0 4.6 3.1 7.8 7.5 9.5 4.4-1.7 7.5-4.9 7.5-9.5V6L12 3Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+                                    <path d="M9 12h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                                </svg>
+                            </div>
+                            <div>
+                                <h3 id="verdictTitle" class="verdict-title">等待检测</h3>
+                                <p id="verdictSubtitle" class="verdict-subtitle">上传图像后启动鉴定，结论会优先显示在这里。</p>
+                            </div>
+                        </div>
+                        <div class="confidence-box">
+                            <div id="confidenceValue" class="confidence-value">--</div>
+                            <div class="meter" aria-label="置信度">
+                                <div id="confidenceBar" class="meter-fill"></div>
+                            </div>
+                            <div class="confidence-label">检测置信度</div>
+                        </div>
+                    </section>
+
+                    <section class="result-facts" aria-label="检测摘要">
+                        <div class="fact">
+                            <span>图片名称</span>
+                            <strong id="factName">--</strong>
+                        </div>
+                        <div class="fact">
+                            <span>检测时间</span>
+                            <strong id="factTime">--</strong>
+                        </div>
+                        <div class="fact">
+                            <span>定位状态</span>
+                            <strong id="factMask">--</strong>
+                        </div>
+                    </section>
+
+                    <section class="analysis-console">
+                        <div class="section-title">
+                            <span>模型输出</span>
+                            <div class="analysis-actions">
+                                <div class="language-toggle" aria-label="输出语言切换">
+                                    <button id="languageZhBtn" class="language-btn" type="button">中文</button>
+                                    <button id="languageEnBtn" class="language-btn is-active" type="button">English</button>
+                                </div>
+                                <span id="streamState" class="stream-state">Idle</span>
+                            </div>
+                        </div>
+                        <div id="analysisOutput" class="analysis-output" aria-live="polite">
+                            <div class="empty-message">等待模型输出</div>
+                        </div>
+                    </section>
+
+                    <div class="report-bar">
+                        <button id="downloadReportBtn" class="report-btn" type="button" disabled>
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                <path d="M12 3v11m0 0 4-4m-4 4-4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                <path d="M5 18.5h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                            </svg>
+                            下载取证报告
+                        </button>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script>
+        (() => {
+            const $ = (selector) => document.querySelector(selector);
+
+            const elements = {
+                uploadArea: $("#uploadArea"),
+                imageInput: $("#imageInput"),
+                imageStage: $("#imageStage"),
+                previewImage: $("#previewImage"),
+                scanLayer: $("#scanLayer"),
+                overlayBadge: $("#overlayBadge"),
+                showOriginalBtn: $("#showOriginalBtn"),
+                showOverlayBtn: $("#showOverlayBtn"),
+                resetBtn: $("#resetBtn"),
+                clearBtn: $("#clearBtn"),
+                analyzeBtn: $("#analyzeBtn"),
+                analyzeIcon: $("#analyzeIcon"),
+                analyzeText: $("#analyzeText"),
+                fileChip: $("#fileChip"),
+                caseChip: $("#caseChip"),
+                verdictStrip: $("#verdictStrip"),
+                verdictTitle: $("#verdictTitle"),
+                verdictSubtitle: $("#verdictSubtitle"),
+                verdictSymbol: $("#verdictSymbol"),
+                confidenceValue: $("#confidenceValue"),
+                confidenceBar: $("#confidenceBar"),
+                factName: $("#factName"),
+                factTime: $("#factTime"),
+                factMask: $("#factMask"),
+                streamState: $("#streamState"),
+                languageZhBtn: $("#languageZhBtn"),
+                languageEnBtn: $("#languageEnBtn"),
+                analysisOutput: $("#analysisOutput"),
+                downloadReportBtn: $("#downloadReportBtn")
+            };
+
+            const state = {
+                file: null,
+                originalObjectUrl: "",
+                originalDataUrl: "",
+                overlayDataUrl: "",
+                displayMode: "original",
+                isAnalyzing: false,
+                forensicComplete: false,
+                verdict: null,
+                analysisTextEn: "",
+                analysisTextZh: "",
+                activeLanguage: "en",
+                hint: "",
+                detectedAt: null,
+                caseId: ""
+            };
+
+            const verdictIcons = {
+                idle: '<svg width="30" height="30" viewBox="0 0 24 24" fill="none"><path d="M12 3 4.5 6v5.5c0 4.6 3.1 7.8 7.5 9.5 4.4-1.7 7.5-4.9 7.5-9.5V6L12 3Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M9 12h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
+                real: '<svg width="30" height="30" viewBox="0 0 24 24" fill="none"><path d="M20 6 9 17l-5-5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+                aigc: '<svg width="30" height="30" viewBox="0 0 24 24" fill="none"><path d="M12 3 2.8 19h18.4L12 3Z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/><path d="M12 9v4.2M12 17h.01" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>',
+                running: '<span class="spinner"></span>'
+            };
+
+            function escapeHtml(value) {
+                return String(value)
+                    .replace(/&/g, "&amp;")
+                    .replace(/</g, "&lt;")
+                    .replace(/>/g, "&gt;")
+                    .replace(/"/g, "&quot;")
+                    .replace(/'/g, "&#039;");
+            }
+
+            function formatBytes(bytes) {
+                if (!Number.isFinite(bytes)) return "--";
+                if (bytes < 1024) return `${bytes} B`;
+                if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+                return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+            }
+
+            function formatPercent(value) {
+                if (!Number.isFinite(value)) return "--";
+                return `${(value * 100).toFixed(1)}%`;
+            }
+
+            function formatTime(value) {
+                if (!value) return "--";
+                const date = value instanceof Date ? value : new Date(value);
+                if (Number.isNaN(date.getTime())) return "--";
+                return date.toLocaleString("zh-CN", { hour12: false });
+            }
+
+            function makeCaseId() {
+                const now = new Date();
+                const stamp = now.toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
+                return `CASE-${stamp}`;
+            }
+
+            function renderMarkdownLite(text, showCursor = false) {
+                const source = text.trim();
+                if (!source) {
+                    return '<div class="empty-message">等待模型输出</div>';
+                }
+
+                const escaped = escapeHtml(source)
+                    .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
+
+                const blocks = escaped.split(/\n{2,}/).map((block) => {
+                    const trimmed = block.trim();
+                    if (!trimmed) return "";
+                    if (/^#{1,3}\s+/.test(trimmed)) {
+                        return `<h3>${trimmed.replace(/^#{1,3}\s+/, "").replace(/\n/g, "<br>")}</h3>`;
+                    }
+                    if (/^&gt;\s?/.test(trimmed)) {
+                        return `<blockquote>${trimmed.replace(/^&gt;\s?/gm, "").replace(/\n/g, "<br>")}</blockquote>`;
+                    }
+                    return `<p>${trimmed.replace(/\n/g, "<br>")}</p>`;
+                }).join("");
+
+                return `${blocks}${showCursor ? '<span class="typing-cursor"></span>' : ""}`;
+            }
+
+            function readFileAsDataUrl(file) {
+                return new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(reader.result);
+                    reader.onerror = () => reject(reader.error);
+                    reader.readAsDataURL(file);
+                });
+            }
+
+            function setFile(file) {
+                if (!file || !file.type.startsWith("image/")) return;
+
+                if (state.originalObjectUrl) {
+                    URL.revokeObjectURL(state.originalObjectUrl);
+                }
+
+                state.file = file;
+                state.originalObjectUrl = URL.createObjectURL(file);
+                state.originalDataUrl = "";
+                state.overlayDataUrl = "";
+                state.displayMode = "original";
+                state.isAnalyzing = false;
+                state.forensicComplete = false;
+                state.verdict = null;
+                state.analysisTextEn = "";
+                state.analysisTextZh = "";
+                state.activeLanguage = "en";
+                state.hint = "";
+                state.detectedAt = null;
+                state.caseId = makeCaseId();
+
+                readFileAsDataUrl(file).then((dataUrl) => {
+                    if (state.file === file) state.originalDataUrl = dataUrl;
+                }).catch(() => {
+                    state.originalDataUrl = "";
+                });
+
+                updateUi();
+            }
+
+            function resetAll() {
+                if (state.originalObjectUrl) {
+                    URL.revokeObjectURL(state.originalObjectUrl);
+                }
+
+                state.file = null;
+                state.originalObjectUrl = "";
+                state.originalDataUrl = "";
+                state.overlayDataUrl = "";
+                state.displayMode = "original";
+                state.isAnalyzing = false;
+                state.forensicComplete = false;
+                state.verdict = null;
+                state.analysisTextEn = "";
+                state.analysisTextZh = "";
+                state.activeLanguage = "en";
+                state.hint = "";
+                state.detectedAt = null;
+                state.caseId = "";
+                elements.imageInput.value = "";
+                updateUi();
+            }
+
+            function setDisplayMode(mode) {
+                if (mode === "overlay" && !state.overlayDataUrl) return;
+                state.displayMode = mode;
+                updateUi();
+            }
+
+            function getDisplayAnalysisText() {
+                if (state.activeLanguage === "en") {
+                    return state.analysisTextEn;
+                }
+                return state.analysisTextZh || state.analysisTextEn;
+            }
+
+            function setLanguage(language) {
+                state.activeLanguage = language;
+                updateUi();
+            }
+
+            function updateUi() {
+                const hasFile = Boolean(state.file);
+                const hasOverlay = Boolean(state.overlayDataUrl);
+                const isAigc = Boolean(state.verdict?.isAigc);
+                const verdictState = state.verdict ? (isAigc ? "aigc" : "real") : (state.isAnalyzing ? "running" : "idle");
+                const displayUrl = state.displayMode === "overlay" && hasOverlay ? state.overlayDataUrl : state.originalObjectUrl;
+                const visibleAnalysisText = getDisplayAnalysisText();
+
+                elements.uploadArea.hidden = hasFile;
+                elements.imageStage.hidden = !hasFile;
+                elements.previewImage.src = displayUrl || "";
+                elements.scanLayer.hidden = !state.isAnalyzing || state.forensicComplete;
+                elements.overlayBadge.hidden = !(state.displayMode === "overlay" && hasOverlay && isAigc);
+
+                elements.fileChip.textContent = hasFile ? `${state.file.name} · ${formatBytes(state.file.size)}` : "未选择图像";
+                elements.caseChip.textContent = state.caseId || "CASE 待生成";
+                elements.factName.textContent = hasFile ? state.file.name : "--";
+                elements.factTime.textContent = formatTime(state.detectedAt);
+                elements.factMask.textContent = !state.verdict
+                    ? "--"
+                    : isAigc
+                        ? (hasOverlay ? "红色高亮图已生成" : (state.isAnalyzing ? "正在生成红色高亮图" : "未生成定位图"))
+                        : "真实图像无需定位";
+
+                elements.analyzeBtn.disabled = !hasFile || state.isAnalyzing;
+                elements.clearBtn.disabled = !hasFile || state.isAnalyzing;
+                elements.resetBtn.disabled = state.isAnalyzing;
+                elements.showOriginalBtn.classList.toggle("is-active", state.displayMode === "original");
+                elements.showOverlayBtn.classList.toggle("is-active", state.displayMode === "overlay");
+                elements.showOverlayBtn.disabled = !hasOverlay;
+                elements.downloadReportBtn.disabled = !state.verdict || state.isAnalyzing;
+
+                elements.analyzeIcon.innerHTML = state.isAnalyzing
+                    ? '<span class="spinner"></span>'
+                    : '<svg width="19" height="19" viewBox="0 0 24 24" fill="none"><path d="M4 12h4l2-7 4 14 2-7h4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+                elements.analyzeText.textContent = state.isAnalyzing
+                    ? (state.forensicComplete ? "整理报告中" : "模型鉴定中")
+                    : (state.verdict ? "重新鉴定" : "开始鉴定");
+
+                elements.verdictStrip.dataset.state = verdictState;
+                elements.verdictSymbol.innerHTML = verdictIcons[verdictState] || verdictIcons.idle;
+                elements.verdictTitle.textContent = state.verdict?.label || (state.isAnalyzing ? "检测中" : "等待检测");
+                elements.verdictSubtitle.textContent = state.verdict
+                    ? (isAigc ? "模型检测到 AI 生成痕迹，正在生成红色高亮图。" : "模型判断该图像更符合真实图像的低阶统计特征。")
+                    : (state.isAnalyzing ? "正在读取低阶像素特征并生成解释。" : "上传图像后启动鉴定，结论显示在此处。");
+
+                const confidence = state.verdict?.confidence;
+                elements.confidenceValue.textContent = formatPercent(confidence);
+                elements.confidenceBar.style.width = Number.isFinite(confidence) ? `${Math.max(0, Math.min(100, confidence * 100))}%` : "0%";
+
+                elements.languageZhBtn.classList.toggle("is-active", state.activeLanguage === "zh");
+                elements.languageEnBtn.classList.toggle("is-active", state.activeLanguage === "en");
+                elements.streamState.textContent = state.isAnalyzing && !state.forensicComplete ? "Streaming" : (visibleAnalysisText ? "Complete" : "Idle");
+                elements.analysisOutput.innerHTML = renderMarkdownLite(visibleAnalysisText, state.isAnalyzing && !state.forensicComplete && Boolean(visibleAnalysisText));
+            }
+
+            function scrollAnalysisToBottom() {
+                updateUi();
+                requestAnimationFrame(() => {
+                    elements.analysisOutput.scrollTop = elements.analysisOutput.scrollHeight;
+                });
+            }
+
+            function appendEnglishAnalysis(text) {
+                state.analysisTextEn += text;
+                scrollAnalysisToBottom();
+            }
+
+            function setChineseAnalysis(text) {
+                state.analysisTextZh = text;
+                scrollAnalysisToBottom();
+            }
+
+            function appendSystemAnalysis(text) {
+                state.analysisTextEn += text;
+                state.analysisTextZh += text;
+                scrollAnalysisToBottom();
+            }
+
+            function consumeSseEvent(rawEvent) {
+                const dataLines = rawEvent
+                    .split(/\n/)
+                    .filter((line) => line.startsWith("data:"))
+                    .map((line) => line.slice(5).trimStart());
+
+                if (!dataLines.length) return;
+
+                try {
+                    const payload = JSON.parse(dataLines.join("\n"));
+                    handlePayload(payload);
+                } catch (error) {
+                    console.warn("SSE parse skipped:", error);
+                }
+            }
+
+            function drainSseBuffer(buffer, flush = false) {
+                let cursor = buffer.indexOf("\n\n");
+                while (cursor !== -1) {
+                    const rawEvent = buffer.slice(0, cursor);
+                    consumeSseEvent(rawEvent);
+                    buffer = buffer.slice(cursor + 2);
+                    cursor = buffer.indexOf("\n\n");
+                }
+
+                if (flush && buffer.trim()) {
+                    consumeSseEvent(buffer);
+                    return "";
+                }
+
+                return buffer;
+            }
+
+            function handlePayload(payload) {
+                if (payload.type === "verdict") {
+                    state.verdict = {
+                        label: payload.label || (payload.is_aigc ? "AIGC图像" : "真实图像"),
+                        isAigc: Boolean(payload.is_aigc),
+                        confidence: Number(payload.confidence)
+                    };
+                    state.detectedAt = payload.detected_at || state.detectedAt || new Date();
+                    updateUi();
+                    return;
+                }
+
+                if (payload.type === "hint") {
+                    state.hint = payload.content || "";
+                    return;
+                }
+
+                if (payload.type === "text") {
+                    appendEnglishAnalysis(payload.content || "");
+                    return;
+                }
+
+                if (payload.type === "translation_text") {
+                    setChineseAnalysis(payload.content || "");
+                    return;
+                }
+
+                if (payload.type === "analysis_done") {
+                    state.forensicComplete = true;
+                    updateUi();
+                    return;
+                }
+
+                if (payload.type === "mask" && payload.content) {
+                    state.overlayDataUrl = payload.content;
+                    if (state.verdict?.isAigc) {
+                        state.displayMode = "overlay";
+                    }
+                    updateUi();
+                    return;
+                }
+
+                if (payload.type === "error") {
+                    appendSystemAnalysis(`\n\n### 内部错误\n${payload.content || "推理过程出现异常。"}`);
+                }
+            }
+
+            async function startAnalysis() {
+                if (!state.file || state.isAnalyzing) return;
+
+                state.isAnalyzing = true;
+                state.forensicComplete = false;
+                state.verdict = null;
+                state.overlayDataUrl = "";
+                state.displayMode = "original";
+                state.analysisTextEn = "";
+                state.analysisTextZh = "";
+                state.activeLanguage = "en";
+                state.hint = "";
+                state.detectedAt = new Date();
+                updateUi();
+
+                const formData = new FormData();
+                formData.append("file", state.file);
+
+                try {
+                    const response = await fetch("/api/analyze", {
+                        method: "POST",
+                        body: formData
+                    });
+
+                    if (!response.ok || !response.body) {
+                        const message = await response.text();
+                        throw new Error(message || `HTTP ${response.status}`);
+                    }
+
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder("utf-8");
+                    let buffer = "";
+
+                    while (true) {
+                        const { value, done } = await reader.read();
+                        if (done) break;
+                        buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+                        buffer = drainSseBuffer(buffer);
+                    }
+
+                    buffer += decoder.decode();
+                    drainSseBuffer(buffer, true);
+                } catch (error) {
+                    state.analysisTextEn = `### 通信链路中断\n无法连接到后端推理引擎或推理中途失败。\n\n${error.message || error}`;
+                    state.analysisTextZh = state.analysisTextEn;
+                } finally {
+                    state.isAnalyzing = false;
+                    state.forensicComplete = false;
+                    updateUi();
+                }
+            }
+
+            function sanitizeFileName(name) {
+                return String(name || "image")
+                    .replace(/\.[^.]+$/, "")
+                    .replace(/[^\w\u4e00-\u9fa5-]+/g, "_")
+                    .slice(0, 80) || "image";
+            }
+
+            async function downloadReport() {
+                if (!state.file || !state.verdict) return;
+
+                if (!state.originalDataUrl) {
+                    state.originalDataUrl = await readFileAsDataUrl(state.file);
+                }
+
+                const isAigc = state.verdict.isAigc;
+                const conclusionColor = isAigc ? "#c93535" : "#118956";
+                const reportTime = formatTime(state.detectedAt || new Date());
+                const reportAnalysisText = state.analysisTextZh.trim() || state.analysisTextEn.trim();
+                const analysisHtml = renderMarkdownLite(reportAnalysisText || "模型未返回解释文本。", false);
+                const originalImage = state.originalDataUrl;
+                const imageReviewSection = isAigc && state.overlayDataUrl
+                    ? `<section><h2>图像取证对照</h2><div class="image-pair"><figure><figcaption>原始图像</figcaption><img src="${originalImage}" alt="原始图像"></figure><figure><figcaption>红色高亮取证图</figcaption><img src="${state.overlayDataUrl}" alt="红色高亮取证图"></figure></div></section>`
+                    : `<section><h2>原始图像</h2><div class="image-single"><figure><figcaption>原始图像</figcaption><img src="${originalImage}" alt="原始图像"></figure></div></section>`;
+
+                const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>${escapeHtml(state.file.name)} 取证报告</title>
+            <style>
+body{margin:0;background:#f4f1e9;color:#16181d;font-family:Inter,Arial,"Microsoft YaHei",sans-serif;}
+.report{width:min(980px,calc(100vw - 48px));margin:36px auto;padding:34px;background:#fff;border:1px solid #ddd4c6;box-shadow:0 18px 60px rgba(0,0,0,.12);}
+header{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;border-bottom:4px solid ${conclusionColor};padding-bottom:22px;}
+.kicker{color:#7b746b;font-size:13px;letter-spacing:.08em;text-transform:uppercase;}
+h1{margin:8px 0 0;font-size:34px;line-height:1.1;}
+.badge{padding:12px 16px;border-radius:8px;background:${conclusionColor};color:#fff;font-size:22px;font-weight:900;white-space:nowrap;}
+.summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:24px 0;}
+.item{padding:14px;border:1px solid #e3dacd;border-radius:8px;background:#fbfaf7;}
+.item span{display:block;color:#7b746b;font-size:12px;}
+.item strong{display:block;margin-top:8px;font-size:16px;word-break:break-all;}
+section{margin-top:26px;}
+h2{margin:0 0 12px;font-size:20px;}
+.image-pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;}
+.image-single{max-width:520px;}
+figure{margin:0;padding:12px;border:1px solid #e3dacd;border-radius:8px;background:#fbfaf7;}
+figcaption{margin-bottom:8px;color:#665d53;font-size:13px;font-weight:700;}
+img{display:block;width:100%;height:260px;object-fit:contain;border:1px solid #ddd4c6;border-radius:8px;background:#f4f1e9;}
+.analysis{padding:18px;border:1px solid #e3dacd;border-radius:8px;background:#fbfaf7;}
+.analysis p{line-height:1.72;margin:0 0 12px;white-space:pre-wrap;}
+.analysis h3{margin:0 0 12px;color:#8a5a00;}
+.analysis strong{color:#007a6d;}
+footer{margin-top:28px;color:#8a8278;font-size:12px;border-top:1px solid #e3dacd;padding-top:14px;}
+@media (max-width:720px){.image-pair{grid-template-columns:1fr}img{height:220px}}
+@media print{body{background:#fff}.report{width:auto;margin:0;border:0;box-shadow:none;}img{height:210px}}
+</style>
+</head>
+<body>
+<main class="report">
+<header>
+<div>
+<div class="kicker">LISA AIGC Forensic Report</div>
+<h1>图像取证报告</h1>
+</div>
+<div class="badge">${escapeHtml(state.verdict.label)}</div>
+</header>
+<section class="summary">
+<div class="item"><span>图片名称</span><strong>${escapeHtml(state.file.name)}</strong></div>
+<div class="item"><span>检测时间</span><strong>${escapeHtml(reportTime)}</strong></div>
+<div class="item"><span>检测结论</span><strong>${escapeHtml(state.verdict.label)}</strong></div>
+<div class="item"><span>检测置信度</span><strong>${escapeHtml(formatPercent(state.verdict.confidence))}</strong></div>
+</section>
+${imageReviewSection}
+<section><h2>模型分析内容</h2><div class="analysis">${analysisHtml}</div></section>
+<footer>报告编号：${escapeHtml(state.caseId || makeCaseId())} · 由本地取证系统自动生成</footer>
+</main>
+</body>
+</html>`;
+
+                const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement("a");
+                link.href = url;
+                link.download = `forensic-report-${sanitizeFileName(state.file.name)}-${Date.now()}.html`;
+                document.body.appendChild(link);
+                link.click();
+                link.remove();
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+            }
+
+            elements.imageInput.addEventListener("change", (event) => {
+                setFile(event.target.files?.[0]);
+            });
+
+            elements.uploadArea.addEventListener("dragover", (event) => {
+                event.preventDefault();
+                elements.uploadArea.classList.add("is-dragging");
+            });
+
+            elements.uploadArea.addEventListener("dragleave", () => {
+                elements.uploadArea.classList.remove("is-dragging");
+            });
+
+            elements.uploadArea.addEventListener("drop", (event) => {
+                event.preventDefault();
+                elements.uploadArea.classList.remove("is-dragging");
+                setFile(event.dataTransfer.files?.[0]);
+            });
+
+            elements.showOriginalBtn.addEventListener("click", () => setDisplayMode("original"));
+            elements.showOverlayBtn.addEventListener("click", () => setDisplayMode("overlay"));
+            elements.resetBtn.addEventListener("click", resetAll);
+            elements.clearBtn.addEventListener("click", resetAll);
+            elements.analyzeBtn.addEventListener("click", startAnalysis);
+            elements.languageZhBtn.addEventListener("click", () => setLanguage("zh"));
+            elements.languageEnBtn.addEventListener("click", () => setLanguage("en"));
+            elements.downloadReportBtn.addEventListener("click", () => {
+                downloadReport().catch((error) => {
+                    console.error(error);
+                    appendSystemAnalysis("\n\n### 报告生成失败\n浏览器未能读取原始图像数据。");
+                });
+            });
+
+            updateUi();
+        })();
+    </script>
+</body>
+</html>
