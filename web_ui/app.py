@@ -17,7 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 from PIL import Image
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 import uvicorn
 
@@ -28,7 +28,21 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 root_dir = os.path.dirname(current_dir)
 sys.path.append(root_dir)
 
-from threading import Thread
+bundle_root = getattr(sys, "_MEIPASS", root_dir)
+runtime_root = os.getcwd() if getattr(sys, "frozen", False) else root_dir
+
+def resource_path(relative_path):
+    return os.path.join(bundle_root, relative_path)
+
+def normalize_hf_model_source(model_source):
+    parsed = urllib.parse.urlparse(model_source)
+    if parsed.netloc == "huggingface.co":
+        path_parts = [part for part in parsed.path.split("/") if part]
+        if len(path_parts) >= 2:
+            return "/".join(path_parts[:2])
+    return model_source
+
+from threading import Lock, Thread
 from transformers import AutoTokenizer, TextIteratorStreamer, CLIPImageProcessor, AutoConfig
 from model.LISA import LISAForCausalLM
 from model.llava import conversation as conversation_lib
@@ -38,7 +52,7 @@ from model.segment_anything.utils.transforms import ResizeLongestSide
 from utils.utils import DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
 
 # ==========================================
-# 百度翻译配置：把你的 AppID 和密钥填到这里
+# 百度翻译配置：
 # ==========================================
 BAIDU_TRANSLATE_APP_ID = "20260622002635886"
 BAIDU_TRANSLATE_SECRET_KEY = "WJjjSC4oAKrdEdp5yUal"
@@ -55,8 +69,18 @@ BAIDU_TRANSLATE_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler
 # 1. 静态参数配置
 # ==========================================
 class Args:
-    version = "../checkpoints_stage2/my_best_model/merged_final"
-    npr_ckpt = "../checkpoints/npr_stage1_augmented_best.pth"
+    default_hf_model = normalize_hf_model_source(os.environ.get(
+        "DEFAULT_HF_MODEL_ID",
+        "broken-ice/AIGI-Detection-model",
+    ))
+    default_local_model = os.environ.get(
+        "DEFAULT_LOCAL_MODEL_PATH",
+        os.path.join(runtime_root, "checkpoints_stage2/my_best_model/merged_final"),
+    )
+    npr_ckpt = os.environ.get(
+        "NPR_CKPT",
+        resource_path("checkpoints/npr_stage1_augmented_best.pth"),
+    )
     precision = "bf16"
     image_size = 1024
     model_max_length = 2048
@@ -88,7 +112,9 @@ class UnifiedNPRExpert(nn.Module):
         super().__init__()
         self.resnet = ResNetExpert(use_low_level="npr", pretrained=False)
         self.classifier = NPRClassifierHead(input_dim=512, num_classes=2)
-        if ckpt_path is not None and os.path.exists(ckpt_path):
+        if ckpt_path is not None:
+            if not os.path.exists(ckpt_path):
+                raise FileNotFoundError(f"NPR checkpoint not found: {ckpt_path}")
             print(f"✅ Loading pretrained NPR expert from {ckpt_path}")
             checkpoint = torch.load(ckpt_path, map_location="cpu")
             self.resnet.load_state_dict(checkpoint['resnet'], strict=True)
@@ -230,38 +256,33 @@ def translate_complete_analysis(text):
     return restore_translation_paragraph_breaks(translated_text)
 
 # ==========================================
-# 3. 全局模型挂载 (只在启动时执行一次)
+# 3. 全局模型状态
 # ==========================================
-print(">>> 正在挂载模型到GPU...")
+print(">>> 正在启动Web服务...")
+print(f">>> 默认Hugging Face主模型: {args.default_hf_model}")
+print(f">>> 默认本地主模型: {args.default_local_model}")
+print(f">>> NPR小权重来源: {args.npr_ckpt}")
 device = torch.device(f"cuda:{args.local_rank}" if torch.cuda.is_available() else "cpu")
-
-tokenizer = AutoTokenizer.from_pretrained(args.version, cache_dir=None, model_max_length=args.model_max_length, padding_side="right", use_fast=False)
-tokenizer.pad_token = tokenizer.unk_token
-if "[SEG]" in tokenizer.get_vocab():
-    args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
-
 torch_dtype = torch.bfloat16 if args.precision == "bf16" else torch.float32
-kwargs = {"torch_dtype": torch_dtype}
-
-cfg = AutoConfig.from_pretrained(args.version)
-cfg.npr_pretrained_path = None 
-
-model = LISAForCausalLM.from_pretrained(args.version, config=cfg, low_cpu_mem_usage=True, seg_token_idx=args.seg_token_idx, **kwargs)
-model.config.eos_token_id = tokenizer.eos_token_id
-model.config.bos_token_id = tokenizer.bos_token_id
-model.config.pad_token_id = tokenizer.pad_token_id
-
-model.get_model().initialize_vision_modules(model.get_model().config)
-vision_tower = model.get_model().get_vision_tower()
-vision_tower.to(dtype=torch_dtype)
-
-model = model.bfloat16().cuda().to(device) if args.precision == "bf16" else model.float().cuda().to(device)
-vision_tower.to(device=args.local_rank)
-
-clip_image_processor = CLIPImageProcessor.from_pretrained(model.config.vision_tower)
 transform = ResizeLongestSide(args.image_size)
-model.eval()
 
+tokenizer = None
+model = None
+clip_image_processor = None
+model_load_thread = None
+model_status_lock = Lock()
+model_status = {
+    "status": "offline",
+    "progress": 0,
+    "message": "主模型未加载",
+    "error": None,
+    "source_type": "huggingface",
+    "source": args.default_hf_model,
+    "default_hf_model": args.default_hf_model,
+    "default_local_model": args.default_local_model,
+}
+
+print(">>> 正在挂载NPR小权重...")
 expert_model = UnifiedNPRExpert(ckpt_path=args.npr_ckpt).cuda().to(device)
 expert_model.eval()
 npr_transform = transforms.Compose([
@@ -270,7 +291,123 @@ npr_transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
 ])
-print(">>> 引擎挂载完毕！服务已就绪。")
+print(">>> Web服务已就绪，主模型等待手动加载。")
+
+def set_model_status(status=None, progress=None, message=None, error=None):
+    with model_status_lock:
+        if status is not None:
+            model_status["status"] = status
+        if progress is not None:
+            model_status["progress"] = int(max(0, min(100, progress)))
+        if message is not None:
+            model_status["message"] = message
+        if error is not None:
+            model_status["error"] = error
+        elif status in {"loading", "online"}:
+            model_status["error"] = None
+        return dict(model_status)
+
+def get_model_status():
+    with model_status_lock:
+        return dict(model_status)
+
+def resolve_model_source(source_type, model_source):
+    source_type = (source_type or "huggingface").strip().lower()
+    if source_type not in {"huggingface", "local"}:
+        raise HTTPException(status_code=400, detail="未知模型加载方式")
+
+    if source_type == "local":
+        resolved_path = os.path.abspath(os.path.expanduser(model_source or args.default_local_model))
+        if not os.path.isdir(resolved_path):
+            raise HTTPException(status_code=400, detail=f"本地主模型目录不存在: {resolved_path}")
+        return "local", resolved_path
+
+    resolved_repo = normalize_hf_model_source((model_source or args.default_hf_model).strip())
+    if not resolved_repo:
+        raise HTTPException(status_code=400, detail="Hugging Face 模型仓库不能为空")
+    return "huggingface", resolved_repo
+
+def load_main_model(model_source):
+    global tokenizer, model, clip_image_processor
+
+    try:
+        print(">>> 开始加载主模型...")
+        set_model_status("loading", 5, "正在加载 tokenizer")
+
+        loaded_tokenizer = AutoTokenizer.from_pretrained(
+            model_source,
+            cache_dir=None,
+            model_max_length=args.model_max_length,
+            padding_side="right",
+            use_fast=False,
+        )
+        loaded_tokenizer.pad_token = loaded_tokenizer.unk_token
+
+        args.seg_token_idx = -1
+        if "[SEG]" in loaded_tokenizer.get_vocab():
+            args.seg_token_idx = loaded_tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
+
+        set_model_status("loading", 20, "正在读取模型配置")
+        cfg = AutoConfig.from_pretrained(model_source)
+        cfg.npr_pretrained_path = None
+
+        kwargs = {"torch_dtype": torch_dtype}
+        set_model_status("loading", 35, "正在加载主模型权重")
+        loaded_model = LISAForCausalLM.from_pretrained(
+            model_source,
+            config=cfg,
+            low_cpu_mem_usage=True,
+            seg_token_idx=args.seg_token_idx,
+            **kwargs,
+        )
+        loaded_model.config.eos_token_id = loaded_tokenizer.eos_token_id
+        loaded_model.config.bos_token_id = loaded_tokenizer.bos_token_id
+        loaded_model.config.pad_token_id = loaded_tokenizer.pad_token_id
+
+        set_model_status("loading", 70, "正在初始化视觉模块")
+        loaded_model.get_model().initialize_vision_modules(loaded_model.get_model().config)
+        vision_tower = loaded_model.get_model().get_vision_tower()
+        vision_tower.to(dtype=torch_dtype)
+
+        set_model_status("loading", 85, "正在移动模型到GPU")
+        if args.precision == "bf16":
+            loaded_model = loaded_model.bfloat16().cuda().to(device)
+        else:
+            loaded_model = loaded_model.float().cuda().to(device)
+        vision_tower.to(device=device)
+
+        set_model_status("loading", 95, "正在加载图像处理器")
+        loaded_clip_image_processor = CLIPImageProcessor.from_pretrained(loaded_model.config.vision_tower)
+        loaded_model.eval()
+
+        tokenizer = loaded_tokenizer
+        model = loaded_model
+        clip_image_processor = loaded_clip_image_processor
+
+        print(">>> 主模型加载完毕。")
+        set_model_status("online", 100, "主模型在线")
+    except Exception as exc:
+        print(f">>> 主模型加载失败: {type(exc).__name__}: {exc}")
+        set_model_status("error", 0, "主模型加载失败", f"{type(exc).__name__}: {exc}")
+
+def start_model_loading(source_type=None, model_source=None):
+    global model_load_thread
+
+    resolved_source_type, resolved_source = resolve_model_source(source_type, model_source)
+
+    with model_status_lock:
+        if model_status["status"] in {"loading", "online"}:
+            return dict(model_status)
+
+        model_status["status"] = "loading"
+        model_status["progress"] = 1
+        model_status["message"] = "正在启动加载任务"
+        model_status["error"] = None
+        model_status["source_type"] = resolved_source_type
+        model_status["source"] = resolved_source
+        model_load_thread = Thread(target=load_main_model, args=(resolved_source,), daemon=True)
+        model_load_thread.start()
+        return dict(model_status)
 
 
 # ==========================================
@@ -284,11 +421,28 @@ async def favicon():
 
 @app.get("/")
 async def get_index():
-    with open(os.path.join(current_dir, "index.html"), "r", encoding="utf-8") as f:
+    with open(resource_path("web_ui/index.html"), "r", encoding="utf-8") as f:
         return HTMLResponse(f.read())
+
+@app.get("/api/model-status")
+async def api_model_status():
+    return get_model_status()
+
+@app.post("/api/load-model")
+async def api_load_model(payload: dict | None = Body(default=None)):
+    payload = payload or {}
+    return start_model_loading(payload.get("source_type"), payload.get("model_source"))
 
 @app.post("/api/analyze")
 async def analyze_image(file: UploadFile = File(...)):
+    active_status = get_model_status()
+    if active_status["status"] != "online" or model is None or tokenizer is None or clip_image_processor is None:
+        raise HTTPException(status_code=503, detail="主模型尚未加载，请先点击加载模型")
+
+    active_model = model
+    active_tokenizer = tokenizer
+    active_clip_image_processor = clip_image_processor
+
     # --- 1. 读取图像与预处理 (保持不变) ---
     contents = await file.read()
     image_np_bgr = cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
@@ -341,18 +495,18 @@ async def analyze_image(file: UploadFile = File(...)):
     conv.append_message(conv.roles[1], "")
     prompt = conv.get_prompt()
 
-    image_clip = clip_image_processor.preprocess(image_np, return_tensors="pt")["pixel_values"][0].unsqueeze(0).cuda().to(device)
+    image_clip = active_clip_image_processor.preprocess(image_np, return_tensors="pt")["pixel_values"][0].unsqueeze(0).cuda().to(device)
     image_clip = image_clip.bfloat16() if args.precision == "bf16" else image_clip.float()
     image = transform.apply_image(image_np)
     resize_list = [image.shape[:2]]
     image = preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous()).unsqueeze(0).cuda().to(device)
     image = image.bfloat16() if args.precision == "bf16" else image.float()
 
-    input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors="pt").unsqueeze(0).cuda().to(device)
-    model.get_model().current_images_npr = image_npr
+    input_ids = tokenizer_image_token(prompt, active_tokenizer, return_tensors="pt").unsqueeze(0).cuda().to(device)
+    active_model.get_model().current_images_npr = image_npr
 
     # --- 2. 准备流式生成器 (Streamer) ---
-    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+    streamer = TextIteratorStreamer(active_tokenizer, skip_prompt=True, skip_special_tokens=True)
     
     result_container = {} # 用于在线程间传递最终的 Mask
 
@@ -360,9 +514,9 @@ async def analyze_image(file: UploadFile = File(...)):
     def generation_task():
         try:
             # 💡 注意：这里传入了 streamer 参数！
-            output_ids, pred_masks = model.evaluate_stream(
+            output_ids, pred_masks = active_model.evaluate_stream(
                 image_clip, image, input_ids, resize_list, original_size_list, 
-                max_new_tokens=2048, tokenizer=tokenizer, streamer=streamer
+                max_new_tokens=2048, tokenizer=active_tokenizer, streamer=streamer
             )
             result_container['masks'] = pred_masks
         except Exception as e:

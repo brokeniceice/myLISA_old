@@ -1,3 +1,4 @@
+#第二版，数据集加载改为直接读取JSONL文件。
 import os
 import random
 import torch

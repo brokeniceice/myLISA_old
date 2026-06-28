@@ -21,7 +21,7 @@ from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
 def parse_args(args):
     parser = argparse.ArgumentParser(description="LISA chat")
     # 🔥 修改 1: 默认路径指向你的合并模型
-    parser.add_argument("--version", default="./checkpoints_stage2/full_half_hint_epoch2/merged_final")
+    parser.add_argument("--version", default="./checkpoints_stage2/my_best_model/merged_final")
     parser.add_argument("--npr_ckpt", type=str, default="./checkpoints/npr_stage1_augmented_best.pth")
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
     parser.add_argument(
@@ -177,7 +177,6 @@ def main(args):
     model.config.pad_token_id = tokenizer.pad_token_id
 
     # 初始化 Vision Modules
-    # 因为上面把 npr_pretrained_path 设为了 None，这里只会初始化 CLIP，不会乱加载 NPR
     model.get_model().initialize_vision_modules(model.get_model().config)
     
     vision_tower = model.get_model().get_vision_tower()
@@ -311,13 +310,13 @@ def main(args):
         input_ids = input_ids.unsqueeze(0).cuda().to(device)
         model.get_model().current_images_npr = image_npr
 
-        output_ids, pred_masks = model.evaluate_analyse(
+        output_ids, pred_masks = model.evaluate(
             image_clip,
             image,
             input_ids,
             resize_list,
             original_size_list,
-            max_new_tokens=8,
+            max_new_tokens=2048,
             tokenizer=tokenizer,
         )
         output_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]

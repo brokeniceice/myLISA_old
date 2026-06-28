@@ -25,6 +25,7 @@ from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
 
 from .multimodal_encoder.builder import build_vision_tower
 from .resnet_expert import build_resnet_expert
+from .resnet import resnet50 #官方NPR仓库
 
 import torch
 import torch.nn as nn
@@ -47,7 +48,7 @@ class StableMultiHeadCrossAttention(nn.Module):
         nn.init.normal_(self.k_proj.weight, std=0.01)
         nn.init.normal_(self.v_proj.weight, std=0.01)
 
-        # 🛡️ 零初始化 (绝杀 NaN 与灾难性干扰)
+        # 🛡️ 零初始化 (防止 NaN 与灾难性干扰)
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
 
@@ -60,13 +61,12 @@ class StableMultiHeadCrossAttention(nn.Module):
         k_fp32 = self.k_proj(k).float()
         v_fp32 = self.v_proj(v).float()
 
-        # 2. 🌟 灵魂切分：变成多头！[Batch, Heads, Length, Head_Dim]
+        # 2. 🌟 切分多头
         q_heads = q_fp32.view(B, L_q, self.num_heads, self.head_dim).transpose(1, 2)
         k_heads = k_fp32.view(B, L_k, self.num_heads, self.head_dim).transpose(1, 2)
         v_heads = v_fp32.view(B, L_k, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # 3. 计算多头注意力分数 (矩阵乘法)
-        # [B, Heads, L_q, Head_Dim] @ [B, Heads, Head_Dim, L_k] -> [B, Heads, L_q, L_k]
+        # 3. 注意力分数
         attn_logits = torch.matmul(q_heads, k_heads.transpose(-2, -1)) * self.scale
 
         # 4. 🛡️ 绝对防线：硬截断 (Logit Clamping)
@@ -76,10 +76,10 @@ class StableMultiHeadCrossAttention(nn.Module):
         attn_weights = F.softmax(attn_logits, dim=-1)
         attn_output_fp32 = torch.matmul(attn_weights, v_heads)
 
-        # 6. 把多头重新拼装回长序列 [Batch, Length, Dim]
+        # 6. 重新拼装
         attn_output_fp32 = attn_output_fp32.transpose(1, 2).contiguous().view(B, L_q, D)
         
-        # 降回主干道精度
+        # 降回主干道精度 (bfloat16)
         attn_output = attn_output_fp32.to(q.dtype)
 
         # 7. 经过全为 0 的输出层
@@ -96,6 +96,7 @@ class LlavaMetaModel:
         #  新增：NPR 专家网络
         # 不加载权重，只占位
         self.npr_tower = build_resnet_expert(config,pretrained=False)
+        # self.npr_tower = resnet50()  #官方NPR仓库
         npr_input_dim = 512
         self.npr_projector = nn.Sequential(
             nn.Linear(npr_input_dim, config.hidden_size),
@@ -127,6 +128,7 @@ class LlavaMetaModel:
             print(f"✅ Loading pretrained NPR expert from {npr_ckpt}")
             checkpoint = torch.load(npr_ckpt, map_location="cpu")
             msg=self.npr_tower.load_state_dict(checkpoint['resnet'], strict=True)
+            # msg=self.npr_tower.load_state_dict(checkpoint, strict=True) #官方NPR仓库
             print(f"✅ 权重加载结果: {msg}")
         else:
             print("⚠️ NPR expert no Stage1 weights)")
@@ -134,7 +136,7 @@ class LlavaMetaModel:
                 print("✅ [Init] No external NPR path provided. Using internal merged weights.")
             else:
                 print("⚠️ Warning: NPR tower not found and no external path provided. Initializing random weights.")
-                self.npr_tower = build_resnet_expert(model_args)
+
         nn.init.zeros_(self.npr_cross_attn.out_proj.weight)
         nn.init.zeros_(self.npr_cross_attn.out_proj.bias)
 
@@ -201,6 +203,7 @@ class LlavaMetaForCausalLM(ABC):
 
         # 2. NPR 流 (微观伪造特征)
         npr_features = self.get_model().npr_tower(images_npr)
+        # _, npr_features = self.get_model().npr_tower(images_npr) #官方NPR仓库
 
         B, C, H, W = npr_features.shape
         npr_features = npr_features.view(B, C, H * W)  
@@ -208,17 +211,12 @@ class LlavaMetaForCausalLM(ABC):
         
         npr_features = self.get_model().npr_projector(npr_features)
         
-        # 3. 特征拼接: [Batch, 512, 4096]
+        # 3. 特征拼接方案
         # combined_features = torch.cat([image_features, npr_features], dim=1)
 
 
-        # =========================================================
-        # 🔥 3. 语义引导的高频交叉注意力融合 (Cross-Attention Fusion)
-        # =========================================================
-        # Q (查询): CLIP 宏观语义特征
-        # K, V (键, 值): NPR 微观异常特征
-        
-        cross_attn = self.get_model().npr_cross_attn.to(image_features.device, dtype=image_features.dtype)
+        # 3. 语义引导的交叉注意力融合方案
+        cross_attn = self.get_model().npr_cross_attn
 
         attn_output = cross_attn(
             q=image_features, 
@@ -226,10 +224,9 @@ class LlavaMetaForCausalLM(ABC):
             v=npr_features
         )
         
-        # 残差连接 + LayerNorm
+        # 残差连接 
         # 结果维度保持不变: [Batch, 256, 4096]
         combined_features = image_features + attn_output
-        # =========================================================
         
         return combined_features
 

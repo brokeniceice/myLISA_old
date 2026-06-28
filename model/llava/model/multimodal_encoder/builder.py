@@ -1,3 +1,5 @@
+import os
+
 from .clip_encoder import CLIPVisionTower
 
 
@@ -7,6 +9,10 @@ def build_vision_tower(vision_tower_cfg, **kwargs):
         "mm_vision_tower",
         getattr(vision_tower_cfg, "vision_tower", None),
     )
+    if os.path.isdir(vision_tower) or os.path.isfile(vision_tower):
+        print(f"Loading vision tower from local path: {vision_tower}")
+        return CLIPVisionTower(vision_tower, args=vision_tower_cfg, **kwargs)
+
     if (
         vision_tower.startswith("openai")
         or vision_tower.startswith("laion")

@@ -105,11 +105,11 @@
         }
 
         .engine-status {
-            display: inline-flex;
+            display: grid;
+            grid-template-columns: auto minmax(128px, 1fr) auto;
             align-items: center;
-            gap: 10px;
-            min-width: 178px;
-            justify-content: center;
+            gap: 9px 10px;
+            min-width: 320px;
             padding: 12px 14px;
             border: 1px solid var(--line);
             border-radius: 8px;
@@ -122,8 +122,95 @@
             width: 9px;
             height: 9px;
             border-radius: 999px;
+            background: var(--red);
+            box-shadow: 0 0 18px rgba(201, 53, 53, 0.62);
+        }
+
+        .engine-status[data-state="loading"] .status-dot {
+            background: var(--amber);
+            box-shadow: 0 0 18px rgba(201, 131, 7, 0.74);
+        }
+
+        .engine-status[data-state="online"] .status-dot {
             background: var(--green);
             box-shadow: 0 0 18px rgba(61, 220, 151, 0.9);
+        }
+
+        .model-status-text {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-weight: 760;
+        }
+
+        .model-load-btn {
+            min-height: 32px;
+            padding: 0 12px;
+            border-radius: 6px;
+            color: #08100f;
+            background: var(--cyan);
+            font-size: 12px;
+            font-weight: 850;
+            cursor: pointer;
+        }
+
+        .model-load-btn:disabled {
+            cursor: not-allowed;
+            opacity: 0.5;
+        }
+
+        .model-source-row {
+            display: grid;
+            grid-column: 1 / -1;
+            grid-template-columns: minmax(112px, auto) minmax(0, 1fr);
+            gap: 8px;
+        }
+
+        .model-source-select,
+        .model-source-input {
+            min-width: 0;
+            min-height: 32px;
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            background: rgba(255, 255, 255, 0.78);
+            color: var(--text);
+            font: inherit;
+            font-size: 12px;
+        }
+
+        .model-source-select {
+            padding: 0 8px;
+        }
+
+        .model-source-input {
+            padding: 0 10px;
+        }
+
+        .model-source-select:disabled,
+        .model-source-input:disabled {
+            cursor: not-allowed;
+            opacity: 0.58;
+        }
+
+        .model-progress {
+            grid-column: 1 / -1;
+            height: 7px;
+            overflow: hidden;
+            border-radius: 999px;
+            background: rgba(22, 24, 29, 0.08);
+        }
+
+        .model-progress-fill {
+            width: 0%;
+            height: 100%;
+            border-radius: inherit;
+            background: var(--amber);
+            transition: width 240ms ease;
+        }
+
+        .upload-area.is-disabled {
+            cursor: not-allowed;
+            opacity: 0.58;
         }
 
         .workspace {
@@ -836,9 +923,20 @@
                 <h1>AIGC 图像取证工作台</h1>
                 <p>AIGC 图像检测 · 细粒度伪造区域定位 · 可解释文本输出</p>
             </div>
-            <div class="engine-status">
-                <span class="status-dot"></span>
-                <span>NPR Expert · LISA Online</span>
+            <div id="engineStatus" class="engine-status" data-state="offline">
+                <span class="status-dot" aria-hidden="true"></span>
+                <span id="modelStatusText" class="model-status-text">主模型离线</span>
+                <button id="loadModelBtn" class="model-load-btn" type="button">加载模型</button>
+                <div class="model-source-row">
+                    <select id="modelSourceType" class="model-source-select" aria-label="模型加载方式">
+                        <option value="huggingface" selected>Hugging Face</option>
+                        <option value="local">本地路径</option>
+                    </select>
+                    <input id="modelSourceInput" class="model-source-input" type="text" value="broken-ice/AIGI-Detection-model" aria-label="模型来源">
+                </div>
+                <div id="modelProgress" class="model-progress" hidden>
+                    <div id="modelProgressBar" class="model-progress-fill"></div>
+                </div>
             </div>
         </header>
 
@@ -972,6 +1070,13 @@
             const $ = (selector) => document.querySelector(selector);
 
             const elements = {
+                engineStatus: $("#engineStatus"),
+                modelStatusText: $("#modelStatusText"),
+                loadModelBtn: $("#loadModelBtn"),
+                modelSourceType: $("#modelSourceType"),
+                modelSourceInput: $("#modelSourceInput"),
+                modelProgress: $("#modelProgress"),
+                modelProgressBar: $("#modelProgressBar"),
                 uploadArea: $("#uploadArea"),
                 imageInput: $("#imageInput"),
                 imageStage: $("#imageStage"),
@@ -1017,7 +1122,18 @@
                 activeLanguage: "en",
                 hint: "",
                 detectedAt: null,
-                caseId: ""
+                caseId: "",
+                modelStatus: {
+                    status: "offline",
+                    progress: 0,
+                    message: "主模型未加载",
+                    error: null
+                },
+                modelDefaults: {
+                    huggingface: "broken-ice/AIGI-Detection-model",
+                    local: "/home/yz/myLISA_old/checkpoints_stage2/my_best_model/merged_final"
+                },
+                modelSourceEdited: false
             };
 
             const verdictIcons = {
@@ -1095,6 +1211,7 @@
             }
 
             function setFile(file) {
+                if (!isModelOnline()) return;
                 if (!file || !file.type.startsWith("image/")) return;
 
                 if (state.originalObjectUrl) {
@@ -1166,21 +1283,88 @@
                 updateUi();
             }
 
+            function isModelOnline() {
+                return state.modelStatus.status === "online";
+            }
+
+            function normalizeModelStatus(payload) {
+                if (payload?.default_hf_model) {
+                    state.modelDefaults.huggingface = payload.default_hf_model;
+                }
+                if (payload?.default_local_model) {
+                    state.modelDefaults.local = payload.default_local_model;
+                }
+
+                state.modelStatus = {
+                    status: payload?.status || "offline",
+                    progress: Number(payload?.progress) || 0,
+                    message: payload?.message || "主模型未加载",
+                    error: payload?.error || null,
+                    sourceType: payload?.source_type || "huggingface",
+                    source: payload?.source || state.modelDefaults.huggingface
+                };
+            }
+
+            function syncModelSourceInput(force = false) {
+                const sourceType = elements.modelSourceType.value;
+                const defaultValue = sourceType === "local"
+                    ? state.modelDefaults.local
+                    : state.modelDefaults.huggingface;
+
+                elements.modelSourceInput.placeholder = defaultValue;
+                if (force || !state.modelSourceEdited || !elements.modelSourceInput.value.trim()) {
+                    elements.modelSourceInput.value = defaultValue;
+                    state.modelSourceEdited = false;
+                }
+            }
+
+            function updateModelStatusUi() {
+                const status = state.modelStatus.status;
+                const progress = Math.max(0, Math.min(100, state.modelStatus.progress || 0));
+                const isLoading = status === "loading";
+                const isOnline = status === "online";
+                const isError = status === "error";
+                const sourceLabel = state.modelStatus.sourceType === "local" ? "本地" : "Hugging Face";
+
+                elements.engineStatus.dataset.state = isOnline ? "online" : (isLoading ? "loading" : "offline");
+                elements.modelStatusText.textContent = isOnline
+                    ? `主模型在线 · ${sourceLabel}`
+                    : isLoading
+                        ? `${state.modelStatus.message || "正在加载主模型"} · ${progress}%`
+                        : isError
+                            ? `加载失败：${state.modelStatus.error || "请重试"}`
+                            : "主模型离线";
+
+                elements.loadModelBtn.disabled = isLoading || isOnline;
+                elements.loadModelBtn.textContent = isOnline ? "已在线" : (isLoading ? "加载中" : "加载模型");
+                elements.modelSourceType.disabled = isLoading || isOnline;
+                elements.modelSourceInput.disabled = isLoading || isOnline;
+                elements.modelProgress.hidden = !isLoading;
+                elements.modelProgressBar.style.width = `${progress}%`;
+            }
+
             function updateUi() {
                 const hasFile = Boolean(state.file);
+                const modelOnline = isModelOnline();
                 const hasOverlay = Boolean(state.overlayDataUrl);
                 const isAigc = Boolean(state.verdict?.isAigc);
                 const verdictState = state.verdict ? (isAigc ? "aigc" : "real") : (state.isAnalyzing ? "running" : "idle");
                 const displayUrl = state.displayMode === "overlay" && hasOverlay ? state.overlayDataUrl : state.originalObjectUrl;
                 const visibleAnalysisText = getDisplayAnalysisText();
 
+                updateModelStatusUi();
+
                 elements.uploadArea.hidden = hasFile;
+                elements.uploadArea.classList.toggle("is-disabled", !modelOnline);
+                elements.imageInput.disabled = !modelOnline || state.isAnalyzing;
                 elements.imageStage.hidden = !hasFile;
                 elements.previewImage.src = displayUrl || "";
                 elements.scanLayer.hidden = !state.isAnalyzing || state.forensicComplete;
                 elements.overlayBadge.hidden = !(state.displayMode === "overlay" && hasOverlay && isAigc);
 
-                elements.fileChip.textContent = hasFile ? `${state.file.name} · ${formatBytes(state.file.size)}` : "未选择图像";
+                elements.fileChip.textContent = hasFile
+                    ? `${state.file.name} · ${formatBytes(state.file.size)}`
+                    : (modelOnline ? "未选择图像" : "请先加载主模型");
                 elements.caseChip.textContent = state.caseId || "CASE 待生成";
                 elements.factName.textContent = hasFile ? state.file.name : "--";
                 elements.factTime.textContent = formatTime(state.detectedAt);
@@ -1190,7 +1374,7 @@
                         ? (hasOverlay ? "红色高亮图已生成" : (state.isAnalyzing ? "正在生成红色高亮图" : "未生成定位图"))
                         : "真实图像无需定位";
 
-                elements.analyzeBtn.disabled = !hasFile || state.isAnalyzing;
+                elements.analyzeBtn.disabled = !modelOnline || !hasFile || state.isAnalyzing;
                 elements.clearBtn.disabled = !hasFile || state.isAnalyzing;
                 elements.resetBtn.disabled = state.isAnalyzing;
                 elements.showOriginalBtn.classList.toggle("is-active", state.displayMode === "original");
@@ -1210,7 +1394,9 @@
                 elements.verdictTitle.textContent = state.verdict?.label || (state.isAnalyzing ? "检测中" : "等待检测");
                 elements.verdictSubtitle.textContent = state.verdict
                     ? (isAigc ? "模型检测到 AI 生成痕迹，正在生成红色高亮图。" : "模型判断该图像更符合真实图像的低阶统计特征。")
-                    : (state.isAnalyzing ? "正在读取低阶像素特征并生成解释。" : "上传图像后启动鉴定，结论显示在此处。");
+                    : (state.isAnalyzing
+                        ? "正在读取低阶像素特征并生成解释。"
+                        : (modelOnline ? "上传图像后启动鉴定，结论显示在此处。" : "主模型离线，请先点击右上角加载模型。"));
 
                 const confidence = state.verdict?.confidence;
                 elements.confidenceValue.textContent = formatPercent(confidence);
@@ -1326,7 +1512,7 @@
             }
 
             async function startAnalysis() {
-                if (!state.file || state.isAnalyzing) return;
+                if (!isModelOnline() || !state.file || state.isAnalyzing) return;
 
                 state.isAnalyzing = true;
                 state.forensicComplete = false;
@@ -1373,6 +1559,66 @@
                 } finally {
                     state.isAnalyzing = false;
                     state.forensicComplete = false;
+                    updateUi();
+                }
+            }
+
+            let modelStatusTimer = null;
+
+            function scheduleModelStatusPoll(delay = 1200) {
+                if (modelStatusTimer) {
+                    clearTimeout(modelStatusTimer);
+                }
+                modelStatusTimer = setTimeout(() => {
+                    refreshModelStatus().catch((error) => {
+                        console.warn("model status poll failed:", error);
+                    });
+                }, delay);
+            }
+
+            async function refreshModelStatus() {
+                const response = await fetch("/api/model-status", { cache: "no-store" });
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                normalizeModelStatus(await response.json());
+                updateUi();
+
+                if (state.modelStatus.status === "loading") {
+                    scheduleModelStatusPoll();
+                }
+            }
+
+            async function startModelLoading() {
+                if (state.modelStatus.status === "loading" || state.modelStatus.status === "online") return;
+                state.modelSourceEdited = true;
+
+                try {
+                    const response = await fetch("/api/load-model", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            source_type: elements.modelSourceType.value,
+                            model_source: elements.modelSourceInput.value.trim()
+                        })
+                    });
+                    if (!response.ok) {
+                        const errorPayload = await response.json().catch(() => null);
+                        const message = errorPayload?.detail || await response.text().catch(() => "");
+                        throw new Error(message || `HTTP ${response.status}`);
+                    }
+
+                    normalizeModelStatus(await response.json());
+                    updateUi();
+                    scheduleModelStatusPoll(500);
+                } catch (error) {
+                    state.modelStatus = {
+                        status: "error",
+                        progress: 0,
+                        message: "加载请求失败",
+                        error: error.message || String(error)
+                    };
                     updateUi();
                 }
             }
@@ -1472,6 +1718,7 @@ ${imageReviewSection}
 
             elements.uploadArea.addEventListener("dragover", (event) => {
                 event.preventDefault();
+                if (!isModelOnline()) return;
                 elements.uploadArea.classList.add("is-dragging");
             });
 
@@ -1481,10 +1728,19 @@ ${imageReviewSection}
 
             elements.uploadArea.addEventListener("drop", (event) => {
                 event.preventDefault();
+                if (!isModelOnline()) return;
                 elements.uploadArea.classList.remove("is-dragging");
                 setFile(event.dataTransfer.files?.[0]);
             });
 
+            elements.modelSourceType.addEventListener("change", () => {
+                syncModelSourceInput(true);
+                updateUi();
+            });
+            elements.modelSourceInput.addEventListener("input", () => {
+                state.modelSourceEdited = true;
+            });
+            elements.loadModelBtn.addEventListener("click", startModelLoading);
             elements.showOriginalBtn.addEventListener("click", () => setDisplayMode("original"));
             elements.showOverlayBtn.addEventListener("click", () => setDisplayMode("overlay"));
             elements.resetBtn.addEventListener("click", resetAll);
@@ -1500,6 +1756,10 @@ ${imageReviewSection}
             });
 
             updateUi();
+            refreshModelStatus().then(() => {
+                syncModelSourceInput(false);
+                updateUi();
+            }).catch(() => updateUi());
         })();
     </script>
 </body>

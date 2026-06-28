@@ -1,3 +1,4 @@
+#官方NPR仓库
 import argparse
 import os
 import sys
@@ -15,7 +16,7 @@ from transformers import AutoTokenizer, CLIPImageProcessor, AutoConfig
 
 # LISA 相关导入
 from model.LISA import LISAForCausalLM
-from model.llava.model.resnet_expert import ResNetExpert
+from model.llava.model.resnet import resnet50
 from model.llava import conversation as conversation_lib
 from model.llava.mm_utils import tokenizer_image_token
 from model.segment_anything.utils.transforms import ResizeLongestSide
@@ -24,51 +25,19 @@ from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
 
 def parse_args():
     parser = argparse.ArgumentParser(description="LISA Classification Evaluation")
-    parser.add_argument("--test_json", type=str, default="./datasets/AIGI-Holmes-Dataset/dataset/train.jsonl")
+    parser.add_argument("--test_json", type=str, default="./datasets/AIGI-Holmes-Dataset/dataset/test_mini_400.jsonl")
     parser.add_argument("--image_root", type=str, default="./datasets/AIGI-Holmes-Dataset")
-    parser.add_argument("--version", default="./checkpoints_stage2/my_best_model/merged_final")
+    parser.add_argument("--version", default="./checkpoints_stage2/office_npr_20260617_045947/merged_final")
+    parser.add_argument("--npr_ckpt", type=str, default="/home/yz/NPR-DeepfakeDetection/checkpoints/experiment_name2026_06_16_11_12_15/model_epoch_best.pth")
     parser.add_argument("--precision", default="bf16", type=str, choices=["fp32", "bf16", "fp16"])
     parser.add_argument("--image_size", default=1024, type=int)
     parser.add_argument("--model_max_length", default=2048, type=int)
-    # parser.add_argument("--vision-tower", default="openai/clip-vit-large-patch14", type=str)
-    parser.add_argument("--npr_ckpt", type=str, default="./checkpoints/npr_stage1_augmented_best.pth")
     parser.add_argument("--disable_expert_hint", action="store_true", default=False, help="是否禁用专家提示词注入")
-    parser.add_argument("--local-rank", default=1, type=int)
+    parser.add_argument("--local-rank", default=0, type=int)
     parser.add_argument("--use_mm_start_end", action="store_true", default=True)
     parser.add_argument("--conv_type", default="llava_v1", type=str)
     return parser.parse_args()
 
-class NPRClassifierHead(nn.Module):
-    def __init__(self, input_dim=512, num_classes=2):
-        super().__init__()
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.head = nn.Linear(input_dim, num_classes)
-        
-    def forward(self, x):
-        x = self.avgpool(x)
-        x = x.view(x.size(0), -1)
-        return self.head(x)
-
-class UnifiedNPRExpert(nn.Module):
-    def __init__(self, ckpt_path=None):
-        super().__init__()
-        self.resnet = ResNetExpert(pretrained=False)
-        self.classifier = NPRClassifierHead(input_dim=512, num_classes=2)
-        
-        if ckpt_path is not None:
-            print(f"✅ Loading pretrained NPR expert from {ckpt_path}")
-            checkpoint = torch.load(ckpt_path, map_location="cpu")
-            msg1=self.resnet.load_state_dict(checkpoint['resnet'], strict=True)
-            msg2=self.classifier.load_state_dict(checkpoint['classifier'], strict=True)
-            print(f"✅ renset加载结果: {msg1} | classifier加载结果: {msg2}")
-        for param in self.parameters():
-            param.requires_grad = False
-            
-    def forward(self, images):
-        spatial_features = self.resnet(images)
-        logits = self.classifier(spatial_features)
-        expert_preds = logits.argmax(dim=1)
-        return spatial_features, expert_preds
 
 def preprocess(
     x,
@@ -120,19 +89,22 @@ def main():
             if line.strip(): test_data.append(json.loads(line))
 
     npr_transform = transforms.Compose([
-            transforms.Resize(224),
-            transforms.CenterCrop((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.48145466, 0.4578275, 0.40821073], 
-                std=[0.26862954, 0.26130258, 0.27577711]
-            )
-        ])
+        transforms.Resize((256, 256)), 
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], 
+            std=[0.229, 0.224, 0.225]
+        )
+    ])
+
     if args.disable_expert_hint:
         print("⏭️ 已跳过提示词注入")
     else:
-        print("🧠 正在初始化独立 NPR 专家网络进行提示词生成...")
-        expert_model = UnifiedNPRExpert(ckpt_path=args.npr_ckpt).to(device)
+        print("🧠 正在使用 NPR 专家网络进行提示词生成...")
+        expert_model = resnet50() 
+        state_dict = torch.load(args.npr_ckpt, map_location='cpu')
+        expert_model.load_state_dict(state_dict, strict=True)
+        expert_model.to(device)
         expert_model.eval()
         batch_size = 32
 
@@ -145,9 +117,8 @@ def main():
             valid_indices = []
 
             batch_gts = [] # 记录当前 Batch 的真实标签
-            
-            for idx, item in enumerate(batch_items):
 
+            for idx, item in enumerate(batch_items):
                 #获取当前图片的真实标签
                 mask_path = item.get("mask", "")
                 if mask_path and len(mask_path.strip()) > 0:
@@ -160,23 +131,22 @@ def main():
                 img_path = os.path.join(args.image_root, clean_path)
                 
                 try:
-                    image_np = cv2.imread(img_path)
-                    if image_np is None: raise ValueError("None")
-                    image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
-                    pil_img = Image.fromarray(image_np)
-                    img_tensors.append(npr_transform(pil_img))
+                    pil_img = Image.open(img_path).convert('RGB')
+                    img_tensor = npr_transform(pil_img)
+                    img_tensors.append(img_tensor)
                     valid_indices.append(idx)
 
                     batch_gts.append(gt_class) # 只有图片成功读取了，才记录其对应的 GT
                 except Exception:
                     print("未读取到图片！！！")
-                    batch_items[idx]["expert_hint"] = "[System Forensic Expert Hint: Failed to analyze low-level pixels.]"
             
             if img_tensors:
                 batch_tensor = torch.stack(img_tensors).to(device)
                 with torch.no_grad():
-                    _, expert_preds = expert_model(batch_tensor)
-                    preds = expert_preds.cpu().numpy()
+                    logits, _ = expert_model(batch_tensor)
+                    probs = torch.sigmoid(logits)
+                    expert_preds = (probs >= 0.5).int().flatten()
+                    preds = expert_preds.cpu().numpy() 
                 
                 expert_y_pred.extend(preds)
                 expert_y_true.extend(batch_gts)
@@ -187,8 +157,7 @@ def main():
                     else:
                         hint = "[System Forensic Expert Hint: Low-level pixel analysis indicates this is a natural image with no forged traces detected.]"
                     batch_items[valid_idx]["expert_hint"] = hint
-
-        # 🔥 释放专家模型，清空显存给 LISA 腾地方
+                    
         del expert_model
         torch.cuda.empty_cache()
         print("✅ 测试集专家提示词注入完成。")
@@ -200,8 +169,6 @@ def main():
         print(f"✅ NPR 实际注入准确率 (Accuracy): {expert_acc * 100:.2f}%")
         print(f"✅ NPR 实际注入 F1 分数 (Macro): {expert_f1 * 100:.2f}%")
         print("="*50 + "\n")
-
-    y_true_cls, y_pred_cls = [], []
 
     print("🚀 初始化 Tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -233,13 +200,15 @@ def main():
     model.get_model().initialize_vision_modules(model.get_model().config)
     vision_tower = model.get_model().get_vision_tower()
     vision_tower.to(dtype=torch_dtype, device=device)
-
     model = model.to(device)
+
     clip_image_processor = CLIPImageProcessor.from_pretrained(model.config.vision_tower)
     transform = ResizeLongestSide(args.image_size)
     model.eval()
-    print("✅ 模型加载完毕，准备纯分类评估！")
+    print("✅ 模型加载完毕")
 
+
+    y_true_cls, y_pred_cls = [], []
 
     pbar = tqdm(test_data, desc="Evaluating Classification")
     for idx, item in enumerate(pbar):
@@ -261,12 +230,11 @@ def main():
             y_pred_cls.append(1 - gt_class) 
             continue
 
-        image_np = cv2.imread(img_path)
-        image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
-        original_size_list = [image_np.shape[:2]]
+        pil_img = Image.open(img_path).convert("RGB")
+        image_np = np.array(pil_img) # 转换为 numpy 供 SAM 使用
 
+        original_size_list = [image_np.shape[:2]]
         image_clip = clip_image_processor.preprocess(image_np, return_tensors="pt")["pixel_values"][0].unsqueeze(0).to(device, dtype=torch_dtype)
-        pil_img = Image.fromarray(image_np)
         image_npr = npr_transform(pil_img).unsqueeze(0).cuda().to(device, dtype=torch_dtype)
         image = transform.apply_image(image_np)
         resize_list = [image.shape[:2]]

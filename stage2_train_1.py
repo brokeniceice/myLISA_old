@@ -1,3 +1,4 @@
+#最早的版本，lora微调大模型，冻结视觉塔和投影层，但lora注入除了大模型还有引入了一些其他少量模块
 import os
 import json
 import cv2
@@ -41,13 +42,13 @@ def parse_args():
     parser.add_argument("--llm_version", type=str, default="/home/yz/myLISA/checkpoints/LISA-7B-v1")
     parser.add_argument("--vision_tower", type=str, default="openai/clip-vit-large-patch14")
     parser.add_argument("--npr_ckpt", type=str, default="./checkpoints/npr_stage1_augmented_best.pth")
-    parser.add_argument("--output_dir", type=str, default="./checkpoints_stage2/full_epoch3_50hint")
+    parser.add_argument("--output_dir", type=str, default="./checkpoints_stage2/full_new_epoch2")
 
 
     parser.add_argument("--batch_size", type=int, default=12, help="显存不够必须设为1")
     parser.add_argument("--grad_accum_steps", type=int, default=2, help="梯度累积步数，模拟大Batch")
     
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--ce_loss_weight", default=1.0, type=float)
     parser.add_argument("--dice_loss_weight", default=0.5, type=float)
@@ -77,17 +78,6 @@ def preprocess(
     padw = img_size - w
     x = F.pad(x, (0, padw, 0, padh))
     return x
-
-
-def sync_vocab_size_in_config(config, vocab_size):
-    config.vocab_size = vocab_size
-    text_config = getattr(config, "text_config", None)
-    if text_config is None:
-        return
-    if isinstance(text_config, dict):
-        text_config["vocab_size"] = vocab_size
-    else:
-        setattr(text_config, "vocab_size", vocab_size)
 
 # 定义分类头
 class NPRClassifierHead(nn.Module):
@@ -268,6 +258,15 @@ def collate_fn(batch, pad_token_id=0):
         "resize_list": resize_list   
     }
 
+def sync_vocab_size_in_config(config, vocab_size):
+    config.vocab_size = vocab_size
+    text_config = getattr(config, "text_config", None)
+    if text_config is None:
+        return
+    if isinstance(text_config, dict):
+        text_config["vocab_size"] = vocab_size
+    else:
+        setattr(text_config, "vocab_size", vocab_size)
 
 # =========================
 # 主函数
@@ -732,6 +731,7 @@ def main():
         merged_model = accelerator.unwrap_model(model).merge_and_unload()
         sync_vocab_size_in_config(merged_model.config, len(tokenizer))
         sync_vocab_size_in_config(merged_model.get_model().config, len(tokenizer))
+
         full_state_dict = merged_model.state_dict()
         keys_to_save = {k: v.cpu() for k, v in full_state_dict.items() if "vision_tower" not in k}
         merged_model.save_pretrained(final_save_path, state_dict=keys_to_save)

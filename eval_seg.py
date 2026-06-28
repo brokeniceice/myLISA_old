@@ -41,7 +41,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="LISA Mask Evaluation")
     parser.add_argument("--test_json", type=str, default="./datasets/AIGI-Holmes-Dataset/dataset/test_mini_400.jsonl")
     parser.add_argument("--image_root", type=str, default="./datasets/AIGI-Holmes-Dataset")
-    parser.add_argument("--version", default="./checkpoints_stage2/full_half_hint_epoch2/merged_final")
+    parser.add_argument("--version", default="./checkpoints_stage2/my_best_model/merged_final")
     parser.add_argument("--precision", default="bf16", type=str, choices=["fp32", "bf16", "fp16"])
     parser.add_argument("--image_size", default=1024, type=int)
     parser.add_argument("--model_max_length", default=2048, type=int)
@@ -86,6 +86,15 @@ def main():
         transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
     ])
 
+    #官方NPR仓库训练出来的专家网络权重采用的预处理方式
+    # npr_transform = transforms.Compose([
+    #     transforms.Resize((256, 256)), 
+    #     transforms.ToTensor(),
+    #     transforms.Normalize(
+    #         mean=[0.485, 0.456, 0.406], 
+    #         std=[0.229, 0.224, 0.225]
+    #     )
+    # ])
 
     # 3. 加载 LISA 大模型
     print("🚀 加载 LISA 模型本体...")

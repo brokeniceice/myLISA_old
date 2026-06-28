@@ -1,3 +1,4 @@
+#真正的lora微调大模型，冻结视觉塔和投影层。(后续对视觉塔和投影层做了不同程度的解冻，但效果都不好，结论：视觉塔和投影层必须冻结，保持原生态)
 import os
 import json
 import cv2
@@ -20,7 +21,8 @@ import transformers
 from transformers import get_cosine_schedule_with_warmup
 transformers.utils.import_utils._torch_flash_attention_2_available = True
 from transformers import CLIPImageProcessor
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model 
+from collections import defaultdict
 
 # 确保路径正确导入
 from model.LISA import LISAForCausalLM
@@ -41,14 +43,18 @@ def parse_args():
     parser.add_argument("--llm_version", type=str, default="/home/yz/myLISA/checkpoints/LISA-7B-v1")
     parser.add_argument("--vision_tower", type=str, default="openai/clip-vit-large-patch14")
     parser.add_argument("--npr_ckpt", type=str, default="./checkpoints/npr_stage1_augmented_best.pth")
-    parser.add_argument("--output_dir", type=str, default="./checkpoints_stage2/full_new_epoch2")
+    parser.add_argument("--output_dir", type=str, default="./checkpoints_stage2/new_improve")
 
 
-    parser.add_argument("--batch_size", type=int, default=16, help="显存不够必须设为1")
+    parser.add_argument("--batch_size", type=int, default=12, help="显存不够必须设为1")
     parser.add_argument("--grad_accum_steps", type=int, default=2, help="梯度累积步数，模拟大Batch")
     
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--lora_lr", type=float, default=2e-4)
+    parser.add_argument("--adapter_lr", type=float, default=2e-4)
+    parser.add_argument("--lm_head_lr", type=float, default=2e-5)
+    parser.add_argument("--vision_lr", type=float, default=2e-5, help="视觉塔解冻高层的学习率")
     parser.add_argument("--ce_loss_weight", default=1.0, type=float)
     parser.add_argument("--dice_loss_weight", default=0.5, type=float)
     parser.add_argument("--bce_loss_weight", default=2.0, type=float)
@@ -77,6 +83,17 @@ def preprocess(
     padw = img_size - w
     x = F.pad(x, (0, padw, 0, padh))
     return x
+
+
+def sync_vocab_size_in_config(config, vocab_size):
+    config.vocab_size = vocab_size
+    text_config = getattr(config, "text_config", None)
+    if text_config is None:
+        return
+    if isinstance(text_config, dict):
+        text_config["vocab_size"] = vocab_size
+    else:
+        setattr(text_config, "vocab_size", vocab_size)
 
 # 定义分类头
 class NPRClassifierHead(nn.Module):
@@ -257,6 +274,25 @@ def collate_fn(batch, pad_token_id=0):
         "resize_list": resize_list   
     }
 
+def reserve_vram(device, reserve_gb=44):
+    """
+    预占指定大小的显存，防止被其他进程抢占。
+    参数:
+        device: 当前所在的 GPU device
+        reserve_gb: 需要预占的显存大小（GB）
+    """
+    try:
+        print(f"🔒 正在预占 {reserve_gb} GB 显存，建立 PyTorch 缓存池...")
+        # 1 GB = 1024^3 bytes。我们分配一个巨大的 int8 (1 byte) 的全零 Tensor
+        dummy_tensor = torch.empty(int(reserve_gb * (1024 ** 3)), dtype=torch.int8, device=device)
+        
+        # 核心操作：删除这个 Tensor
+        # 此时这 44GB 显存会回到 PyTorch 的 Caching Allocator 中
+        # nvidia-smi 依然会显示这部分显存被占用，其他人的进程进不来
+        del dummy_tensor
+        print(f"✅ 成功霸占 {reserve_gb} GB 显存！")
+    except RuntimeError as e:
+        print(f"❌ 预占显存失败，请检查当前 GPU 是否还有 {reserve_gb} GB 空闲显存。")
 
 # =========================
 # 主函数
@@ -272,6 +308,11 @@ def main():
     device = accelerator.device
     time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     args.output_dir = f"{args.output_dir}_{time_str}"
+
+    if accelerator.is_main_process:
+        print("🛡️ 启动防 OOM 显存保护机制...")
+    # 假设你希望最高霸占 44GB，可以设置 44。如果是单卡，直接占满都可以。
+    reserve_vram(device, reserve_gb=46)
 
     if accelerator.is_main_process: # 🔥 新增：仅在主进程创建文件夹和初始化日志，防止冲突
         os.makedirs(args.output_dir, exist_ok=True)
@@ -401,6 +442,8 @@ def main():
     config.train_mask_decoder = True 
     config.npr_pretrained_path = args.npr_ckpt
     config.attention_bias = False
+    config.vision_tower = args.vision_tower
+    config.mm_vision_tower = args.vision_tower
     for attr, default in [("attention_dropout", 0.0), ("rope_theta", 10000.0), ("intermediate_dropout", 0.0)]:
         if not hasattr(config, attr):
             setattr(config, attr, default)
@@ -437,41 +480,106 @@ def main():
         model.config.use_cache = False 
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
+    exclude_list = [
+        "vision_tower", "npr_projector", "npr_cross_attn", 
+        "embed_tokens", "lm_head", "mask_decoder", "text_hidden_fcs"
+    ]
+    
+    target_modules = []
+    lora_keywords = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    for name, module in model.named_modules():
+        # 1. 排除名单
+        if any(ex_key in name for ex_key in exclude_list):
+            continue
+            
+        # 2. 大模型lora目标层
+        if any(name.endswith(kw) for kw in lora_keywords):
+            target_modules.append(name)
+
+    if accelerator.is_main_process:
+        print(f"🎯 过滤完成！共找到 {len(target_modules)} 个模块准备注入 LoRA。")
+
+    # 注入 LoRA
     lora_config = LoraConfig(
         r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
-        target_modules=[
-            "q_proj", 
-            "k_proj", 
-            "v_proj", 
-            "o_proj",
-            "gate_proj", 
-            "up_proj", 
-            "down_proj"
-        ], bias="none", task_type="CAUSAL_LM",
+        target_modules=target_modules, bias="none", task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_config)
     model.to(dtype=torch.bfloat16, device=device)
-    trainable_keys = ["npr_projector","npr_cross_attn", "lora", "embed_tokens", "lm_head", "mask_decoder","text_hidden_fcs"]
 
-    from collections import defaultdict
-    key_param_count = defaultdict(int)
+    if accelerator.is_main_process:
+        # 实时抓取刚刚生成的全部 lora 权重
+        injected_lora_params = sum(param.numel() for name, param in model.named_parameters() if "lora" in name)
+        
+        print(f"🎯 检查：共找到 {len(target_modules)} 个 LoRA 模块。")
+        print(f"💉 产生 LoRA 参数量: {injected_lora_params / 1e6:.2f} M")
+
+    exclude_list = [
+        "npr_projector", "npr_cross_attn", 
+        "embed_tokens", "lm_head", "mask_decoder", "text_hidden_fcs"
+    ]
+    # 依次参数解冻其他所有模块
     for name, param in model.named_parameters():
-        for key in trainable_keys:
-            if key in name:
-                param.requires_grad = True
-                key_param_count[key] += param.numel()
-                break  # 防止一个参数被多个 key 重复统计
+        if any(key in name for key in exclude_list):
+            param.requires_grad = True
+    
+    key_param_count = defaultdict(int)
+    print_keys = ["llm_lora", "vision_lora"] + exclude_list
 
-    # 打印每个模块参数量
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue # 没解冻的直接不统计
+        
+        if "lora" in name:
+            if "vision_tower" in name:
+                key_param_count["vision_lora"] += param.numel()
+            else:
+                key_param_count["llm_lora"] += param.numel()
+
+        else:
+            # 统计其他解冻的适配器
+            for key in exclude_list:
+                if key in name:
+                    key_param_count[key] += param.numel()
+                    break
+
+    # 打印最终表格
     if accelerator.is_main_process:
         print("\n📊 各模块可训练参数量：")
         total = 0
-        for key in trainable_keys:
+        for key in print_keys:
             count = key_param_count[key]
-            total += count
-            print(f"{key:20s}: {count / 1e6:8.2f} M")
-        print(f"\n📊 总可训练参数量: {total / 1e6:.2f} M")
+            if count > 0:
+                total += count
+                print(f"{key:20s}: {count / 1e6:8.2f} M")
+        print("-" * 35)
+        print(f"📊 总可训练参数量  : {total / 1e6:8.2f} M\n")
+
+    llm_lora_params = []
+    vision_lora_params = []
+    adapter_params = []
+    lm_head_params = []
+    fallback_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "lora" in name:
+            if "vision_tower" in name:
+                vision_lora_params.append(param)
+            else:
+                llm_lora_params.append(param)
+        
+        elif any(keyword in name for keyword in ["npr_projector", "npr_cross_attn", "mask_decoder", "text_hidden_fcs"]):
+            adapter_params.append(param)
+        
+        elif any(keyword in name for keyword in ["embed_tokens", "lm_head"]):
+            lm_head_params.append(param)
+        else:
+            fallback_params.append(param)
+
     model.resize_token_embeddings(len(tokenizer))
+    sync_vocab_size_in_config(model.config, len(tokenizer))
+    sync_vocab_size_in_config(model.get_model().config, len(tokenizer))
 
     image_processor = CLIPImageProcessor.from_pretrained(args.vision_tower)
     train_dataset = AIGIDataset(train_data, tokenizer, image_processor, args.image_root)
@@ -491,11 +599,21 @@ def main():
             collate_fn=partial(collate_fn, pad_token_id=tokenizer.pad_token_id),
         )
     
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=args.lr,
-        weight_decay=0.01,
-    )
+    optimizer_param_groups = []
+    # 大模型 LoRA 用 2e-4
+    if llm_lora_params:
+        optimizer_param_groups.append({"params": llm_lora_params, "lr": args.lora_lr})
+    # 视觉塔 LoRA 用 2e-5 
+    if vision_lora_params:
+        optimizer_param_groups.append({"params": vision_lora_params, "lr": args.vision_lr})
+    if adapter_params:
+        optimizer_param_groups.append({"params": adapter_params, "lr": args.adapter_lr})
+    if lm_head_params:
+        optimizer_param_groups.append({"params": lm_head_params, "lr": args.lm_head_lr})
+    if fallback_params:
+        optimizer_param_groups.append({"params": fallback_params, "lr": args.lr})
+
+    optimizer = torch.optim.AdamW(optimizer_param_groups, weight_decay=0.01)
     model, optimizer, train_loader, val_loader = accelerator.prepare(
         model, optimizer, train_loader, val_loader
     )
@@ -707,6 +825,8 @@ def main():
             save_path = os.path.join(args.output_dir, f"epoch_{epoch+1}")
             os.makedirs(save_path, exist_ok=True)
             # 🔥 修改：解包后再保存
+            sync_vocab_size_in_config(accelerator.unwrap_model(model).config, len(tokenizer))
+            sync_vocab_size_in_config(accelerator.unwrap_model(model).get_model().config, len(tokenizer))
             accelerator.unwrap_model(model).save_pretrained(save_path)
             tokenizer.save_pretrained(save_path)
 
@@ -715,10 +835,20 @@ def main():
         os.makedirs(final_save_path, exist_ok=True)
         # 🔥 修改：解包后再 merge
         merged_model = accelerator.unwrap_model(model).merge_and_unload()
+        sync_vocab_size_in_config(merged_model.config, len(tokenizer))
+        sync_vocab_size_in_config(merged_model.get_model().config, len(tokenizer))
+
         full_state_dict = merged_model.state_dict()
         keys_to_save = {k: v.cpu() for k, v in full_state_dict.items() if "vision_tower" not in k}
         merged_model.save_pretrained(final_save_path, state_dict=keys_to_save)
         tokenizer.save_pretrained(final_save_path)
+
+        # updated_vision_tower_path = os.path.join(final_save_path, "updated_vision_tower")
+        # raw_vision_tower = merged_model.get_model().get_vision_tower()
+        # if hasattr(raw_vision_tower, "vision_tower"):
+        #     raw_vision_tower.vision_tower.save_pretrained(updated_vision_tower_path)
+        #     image_processor.save_pretrained(updated_vision_tower_path)
+        #     print(f"💾 微调后的全新视觉塔权重已成功保存至: {updated_vision_tower_path}")
         print("🎉 Stage-2 训练与验证流程圆满结束！")
 
 if __name__ == "__main__":

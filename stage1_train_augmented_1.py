@@ -1,3 +1,4 @@
+# 第一版，数据集加载按照train/val的目录结构进行，且使用了7种不同的训练变换（包括原图）.
 import os
 import random
 import torch
